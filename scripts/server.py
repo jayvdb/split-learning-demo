@@ -5,9 +5,11 @@ from typing import Any
 
 import click
 import lightning as L
+import onnx
 import torch
 from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from onnx import numpy_helper
 from torch import nn
 from uvicorn import Config, Server
 
@@ -21,6 +23,41 @@ from split_learning.utils.serde import (
     encode_message_b64,
     serialize_tensor,
 )
+
+
+def load_onnx_weights(model: nn.Module, onnx_path: Path) -> list[str]:
+    onnx_model = onnx.load(str(onnx_path))
+    onnx_weights = {
+        init.name: torch.from_numpy(numpy_helper.to_array(init).copy())
+        for init in onnx_model.graph.initializer
+    }
+    state_dict = model.state_dict()
+    unmatched: list[str] = []
+    for key, current in state_dict.items():
+        candidate = onnx_weights.get(key)
+        if candidate is not None and candidate.shape == current.shape:
+            state_dict[key] = candidate
+        else:
+            unmatched.append(key)
+    model.load_state_dict(state_dict)
+    return unmatched
+
+
+def export_onnx(model: nn.Module, onnx_path: Path, example_input: torch.Tensor) -> None:
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    was_training = model.training
+    model.eval()
+    try:
+        torch.onnx.export(
+            model,
+            example_input,
+            str(onnx_path),
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        )
+    finally:
+        model.train(was_training)
 
 
 class ConnectionManager:
@@ -118,10 +155,19 @@ def main(
         img_size=28,
         dropout=0.15,
     )
-    model_path = utils.data_path() / "models/mnist/model.pt"
-    model.load_state_dict(torch.load(model_path))
+    server_onnx_path = utils.workspace_root_path() / "data/models/server_mnist.onnx"
 
     model = CNN2DServer(in_channels=1, dim_out=10, img_size=28, model=model)
+    if server_onnx_path.exists():
+        unmatched = load_onnx_weights(model, server_onnx_path)
+        if unmatched:
+            _logger.warning(f"ONNX weights not loaded for: {unmatched}")
+        else:
+            _logger.info(f"Loaded server weights from {server_onnx_path}")
+    else:
+        _logger.info(f"No server weights at {server_onnx_path}; starting from random")
+
+    unwrapped_model = model
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
     criterion = nn.CrossEntropyLoss()
     model, optimizer = fabric.setup(model, optimizer)
@@ -129,6 +175,7 @@ def main(
     @app.websocket("/ws", api_prefix)
     async def websocket_endpoint(websocket: WebSocket):
         await manager.connect(websocket)
+        trained_this_session = False
         try:
             while True:
                 optimizer.zero_grad()
@@ -149,6 +196,7 @@ def main(
                     labels = labels.to(fabric.device)
 
                     model.train()
+                    trained_this_session = True
                     activations.requires_grad = True
                     outputs = model(activations)
                     loss = criterion(outputs, labels)
@@ -190,6 +238,10 @@ def main(
                     await websocket.send_bytes(encoded_response)
         except WebSocketDisconnect:
             manager.disconnect(websocket)
+            if trained_this_session:
+                example_input = torch.zeros(1, 16, 7, 7, device=fabric.device)
+                export_onnx(unwrapped_model, server_onnx_path, example_input)
+                _logger.info(f"Saved trained server weights to {server_onnx_path}")
         except Exception as e:
             _logger.error(e)
             raise e
