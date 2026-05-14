@@ -93,6 +93,7 @@ dependencies:
     # - tokenizers
     # - evaluate
     - einops
+    - mkl<2024.1
 
     # Federated Learning
     # - syft
