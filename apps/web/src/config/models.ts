@@ -7,9 +7,9 @@ export interface ModelConfig {
 
 export const models: Record<string, ModelConfig[]> = {
     mnist: [
+        { name: "LeNet-5 SplitNN", path: "/models/client_mnist.onnx", type: "splitnn" },
         { name: "LeNet-5", path: "/models/mnist.onnx", type: "local" },
-        { name: "ORT Demo", path: "/models/mnist_default.onnx", type: "local" },
-        { name: "LeNet-5 SplitNN", path: "/models/client_mnist.onnx", type: "splitnn" }
+        { name: "ORT Demo", path: "/models/mnist_default.onnx", type: "local" }
     ],
     quickdraw: [{ name: "LeNet-5", path: "/models/quickdraw.onnx", type: "local" }]
 };

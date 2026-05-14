@@ -15,6 +15,7 @@ import split_learning
 from split_learning.models.vision.cnn_2d import CNN2DClient
 from split_learning.schemas.message import MessageType, WSMessage
 from split_learning.utils import datasets as datasets
+from split_learning.utils import utils
 from split_learning.utils.serde import (
     decode_message_b64,
     deserialize_tensor,
@@ -118,8 +119,13 @@ def main(
 
     # model
     model = CNN2DClient(in_channels=1, dim_out=10, img_size=28)
+    unwrapped_model = model
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
     model, optimizer = fabric.setup(model, optimizer)
+
+    client_onnx_path = (
+        utils.workspace_root_path() / "apps/web/public/models/client_mnist.onnx"
+    )
 
     uri = f"ws://{host}:{port}{endpoint}"
 
@@ -183,6 +189,23 @@ def main(
             raise e
 
     asyncio.get_event_loop().run_until_complete(train_splitnn())
+
+    client_onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    example_input = torch.zeros(1, 1, 28, 28, device=fabric.device)
+    was_training = unwrapped_model.training
+    unwrapped_model.eval()
+    try:
+        torch.onnx.export(
+            unwrapped_model,
+            example_input,
+            str(client_onnx_path),
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+        )
+    finally:
+        unwrapped_model.train(was_training)
+    _logger.info(f"Saved trained client weights to {client_onnx_path}")
 
 
 if __name__ == "__main__":

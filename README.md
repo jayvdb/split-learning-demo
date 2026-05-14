@@ -40,7 +40,7 @@ Demos scripts can be found in the `scripts` directory.
 
 ### Server/Client
 
-To run a simple client/server split leraning setup:
+To run a simple client/server split learning setup:
 
 ```sh
 python scripts/server.py --learning-rate=0.01
@@ -51,6 +51,9 @@ In a different terminal:
 ```sh
 python scripts/client.py --learning-rate=0.01
 ```
+
+After completion, the client will write `apps/web/public/models/client_mnist.onnx`
+and the server will write `data/models/server_mnist.onnx`.
 
 ### Server/Web
 
@@ -69,12 +72,16 @@ pnpm run dev
 
 Navigate to `http://localhost:5173` in your browser. The websocket server will default to `ws://127.0.0.1:8000/ws`.
 
+To perform split inference, change the model to LeNet-5 SplitNN,
+
+The other models do not communicate with the backend.
+
 ### MPI
 
 To run the MPI demo with 1 server and 1 client:
 
 ```sh
-mpirun -n 2 python scripts/mpi.py --leanring-rate=0.01
+mpirun -n 2 python scripts/mpi.py --learning-rate=0.01
 ```
 
 ## TODO
