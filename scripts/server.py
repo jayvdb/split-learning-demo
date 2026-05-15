@@ -64,6 +64,15 @@ _logger = logging.getLogger(__name__)
 # training
 @click.option("--learning-rate", "learning_rate", type=float, default=1e-4)
 @click.option("--grad-clip", "grad_clip", type=float, default=0.5)
+# runtime
+@click.option(
+    "--accelerator",
+    "accelerator",
+    type=click.Choice(["auto", "cpu", "gpu", "cuda", "mps", "tpu"]),
+    default="auto",
+    show_default=True,
+    help="Lightning Fabric accelerator backend.",
+)
 # logging
 @click.option("--grad-accumulate-every", "grad_accumulate_every", type=int, default=4)
 @click.option("--validate-every", "validate_every", type=int, default=100)
@@ -79,6 +88,8 @@ def main(
     # training
     learning_rate: float,
     grad_clip: float,
+    # runtime
+    accelerator: str,
     # logging
     grad_accumulate_every: int,
     validate_every: int,
@@ -95,7 +106,7 @@ def main(
     )
 
     # accelerator
-    fabric = L.Fabric(accelerator="gpu", precision="32-true")
+    fabric = L.Fabric(accelerator=accelerator, precision="32-true")
     fabric.launch()
 
     # webserver

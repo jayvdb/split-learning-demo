@@ -21,6 +21,10 @@ conda create -f environment.yml
 conda activate split-learning-demo
 ```
 
+If your operating system is not Linux or Windows (64bit), or doesnt have an Nvidia GPU,
+remove the line containing `pytorch::pytorch-cuda` from `environment.yml` before creating
+the environment.
+
 ### Web
 
 To install the webapp:
