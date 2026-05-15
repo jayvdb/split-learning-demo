@@ -45,6 +45,15 @@ _logger = logging.getLogger(__name__)
 @click.option("--host", "host", type=str, default="127.0.0.1")
 @click.option("--port", "port", type=int, default=8000)
 @click.option("--endpoint", "endpoint", type=str, default="/ws")
+# runtime
+@click.option(
+    "--accelerator",
+    "accelerator",
+    type=click.Choice(["auto", "cpu", "gpu", "cuda", "mps", "tpu"]),
+    default="auto",
+    show_default=True,
+    help="Lightning Fabric accelerator backend.",
+)
 # logging
 @click.option("--grad-accumulate-every", "grad_accumulate_every", type=int, default=4)
 @click.option("--validate-every", "validate_every", type=int, default=100)
@@ -66,6 +75,8 @@ def main(
     host: str,
     port: int,
     endpoint: str,
+    # runtime
+    accelerator: str,
     # logging
     grad_accumulate_every: int,
     validate_every: int,
@@ -82,7 +93,7 @@ def main(
     )
 
     # accelerator
-    fabric = L.Fabric(accelerator="auto", precision="32-true")
+    fabric = L.Fabric(accelerator=accelerator, precision="32-true")
     fabric.launch()
 
     # dataset
