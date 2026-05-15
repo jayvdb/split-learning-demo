@@ -80,7 +80,7 @@ def main(
     )
 
     # accelerator
-    fabric = L.Fabric(accelerator="gpu", precision="32-true")
+    fabric = L.Fabric(accelerator="auto", precision="32-true")
     fabric.launch()
 
     # dataset

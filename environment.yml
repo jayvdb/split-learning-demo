@@ -67,9 +67,9 @@ dependencies:
     # - scikit-fuzzy
     - onnx
     - onnxruntime
-    - pytorch::pytorch>=2.0.1
-    - pytorch::torchvision
-    # - pytorch::torchaudio
+    - pytorch>=2.0.1
+    - torchvision
+    # - torchaudio
     - pytorch::pytorch-cuda=11.8
     # - pytorch::cpuonly
     - lightning
