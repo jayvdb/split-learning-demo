@@ -106,12 +106,6 @@ It connects, then verifies three round-trips:
 Exits 0 on success, 2 on a shape / loss assertion failure, 3 if it can't
 reach the server.
 
-The training-artifact pipeline has its own smoke step baked into
-`scripts/generate_training_artifacts.py` — after writing the four artifact
-files it loads them through `onnxruntime.training.api.Module` and runs one
-train+optimizer step on zero inputs, which catches IR-version drift and
-input-naming mismatches.
-
 ## TODO
 
 -   [x] Add a simple local baseline model for comparisons

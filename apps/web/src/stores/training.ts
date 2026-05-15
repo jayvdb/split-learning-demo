@@ -1,34 +1,22 @@
 import { arrayToB64, b64ToArray } from "@/lib/utils/serde";
-import {
-    createTrainingSession,
-    defaultArtifactPaths,
-    zerosLikeActivations,
-    Tensor
-} from "@/lib/utils/training";
+import { createClientModel, tensorFromFloat32, tf, type ClientModel } from "@/lib/utils/training";
 import { useWebsocketStore } from "@/stores/websocket";
-import type { TrainingSession } from "onnxruntime-web/training";
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { ref, watch } from "vue";
 
 type Status = "idle" | "loading" | "training" | "done" | "error";
 
 const describeError = (e: unknown): string => {
-    // ORT's wasm runtime sometimes throws raw numbers (emscripten exception
-    // pointers) or strings, not Error objects. Extract anything we can —
-    // and always dump the original to the console so the stack survives.
     // eslint-disable-next-line no-console
     console.error("[training] error:", e);
     if (e instanceof Error) {
+        // eslint-disable-next-line no-console
         try {
-            // eslint-disable-next-line no-console
             console.error("[training] stack:", e.stack);
         } catch {
             /* ignore */
         }
         return `${e.name}: ${e.message}`;
-    }
-    if (typeof e === "number") {
-        return `wasm exception (pointer ${e}) — check the browser console for ORT runtime output`;
     }
     if (typeof e === "string") return e;
     try {
@@ -38,140 +26,176 @@ const describeError = (e: unknown): string => {
     }
 };
 
-const decodeEnvelope = (raw: string): { type: string; data: any; raw: Record<string, string> } => {
+interface Envelope {
+    type: string;
+    data: Record<string, unknown>;
+    raw: Record<string, string>;
+}
+
+const decodeEnvelope = (raw: string): Envelope => {
     const json = atob(raw);
     return JSON.parse(json);
 };
 
-const encodeEnvelope = (envelope: {
-    type: string;
-    data: Record<string, unknown>;
-    raw: Record<string, string>;
-}) => {
+const encodeEnvelope = (envelope: Envelope) => {
     const json = JSON.stringify(envelope);
-    const b64 = btoa(json);
-    return new TextEncoder().encode(b64);
+    return new TextEncoder().encode(btoa(json));
 };
-
-const tensorToB64 = (tensor: Tensor) =>
-    arrayToB64(tensor.data as Float32Array | BigInt64Array);
 
 const waitFor = <T>(
     subscribe: (cb: (data: string) => void) => () => boolean,
-    matcher: (envelope: ReturnType<typeof decodeEnvelope>) => T | undefined
+    matcher: (envelope: Envelope) => T | undefined,
+    signal: AbortSignal
 ): Promise<T> =>
-    new Promise<T>(resolve => {
+    new Promise<T>((resolve, reject) => {
+        if (signal.aborted) {
+            reject(new Error("aborted"));
+            return;
+        }
         const unsubscribe = subscribe(raw => {
             try {
                 const envelope = decodeEnvelope(raw);
                 const value = matcher(envelope);
                 if (value !== undefined) {
                     unsubscribe();
+                    signal.removeEventListener("abort", onAbort);
                     resolve(value);
                 }
             } catch {
                 /* not a JSON envelope; ignore */
             }
         });
+        const onAbort = () => {
+            unsubscribe();
+            signal.removeEventListener("abort", onAbort);
+            reject(new Error("aborted"));
+        };
+        signal.addEventListener("abort", onAbort);
     });
+
+const float32FromB64 = (b64: string) => b64ToArray(b64, "float32") as Float32Array;
+const int64FromB64 = (b64: string) => b64ToArray(b64, "int64") as BigInt64Array;
+const float32ToB64 = (a: Float32Array) => arrayToB64(a);
+const int64ToB64 = (a: BigInt64Array) => arrayToB64(a);
 
 export const useTrainingStore = defineStore("training", () => {
     const websocket = useWebsocketStore();
 
-    const session = ref<TrainingSession | null>(null);
+    const client = ref<ClientModel | null>(null);
     const status = ref<Status>("idle");
     const error = ref<string | null>(null);
 
     const epochs = ref(3);
     const epoch = ref(0);
     const batch = ref(0);
-    const batchesPerEpoch = ref(0); // discovered on first batch
+    const batchesPerEpoch = ref(0);
     const loss = ref<number | null>(null);
     const lossHistory = ref<number[]>([]);
+    // Client-side SGD learning rate. The user is expected to set this so it
+    // matches `scripts/server.py --learning-rate`; we don't forward it
+    // over the protocol because the server's optimizer is fixed at process
+    // start.
+    const learningRate = ref(0.01);
 
-    const ensureSession = async () => {
-        if (session.value) return session.value;
-        status.value = "loading";
-        // eslint-disable-next-line no-console
-        console.info("[training] loading ORT TrainingSession from %o", defaultArtifactPaths());
-        try {
-            session.value = await createTrainingSession(defaultArtifactPaths());
+    const ensureModel = (): ClientModel => {
+        if (!client.value) {
+            status.value = "loading";
             // eslint-disable-next-line no-console
-            console.info(
-                "[training] session ready. trainingInputNames=%o evalInputNames=%o",
-                session.value.trainingInputNames,
-                session.value.evalInputNames
-            );
-            return session.value;
-        } catch (e) {
-            status.value = "error";
-            error.value = `Failed to load training session: ${describeError(e)}`;
-            throw e;
+            console.info("[training] building TF.js client model (backend=%s)", tf.getBackend());
+            client.value = createClientModel(learningRate.value);
         }
+        return client.value;
     };
 
-    const requestBatch = async (): Promise<{
-        images: Tensor;
-        labels: Tensor;
+    // Live-update the optimizer's LR when the user edits the widget. Takes
+    // effect on the next train step; no need to dispose the model.
+    watch(learningRate, lr => {
+        if (client.value) client.value.setLearningRate(lr);
+    });
+
+    // Each `start()` owns an AbortController so a WebSocket drop (or a
+    // user-triggered reset) can cancel any in-flight `waitFor` and let the
+    // loop exit cleanly instead of hanging forever.
+    let abortController: AbortController | null = null;
+
+    // If the WebSocket drops while training is running, surface it as an
+    // error — the in-flight `waitFor` would otherwise hang forever and the
+    // panel would just sit there spinning with no explanation. The
+    // `inTrainingPhase` derivation in Home.vue includes the "error" state,
+    // so the panel stays visible.
+    watch(
+        () => websocket.status,
+        wsStatus => {
+            if (wsStatus === "closed" && status.value === "training") {
+                // eslint-disable-next-line no-console
+                console.warn("[training] WS dropped mid-training; halting loop");
+                abortController?.abort();
+            }
+        }
+    );
+
+    const requestBatch = async (
+        signal: AbortSignal
+    ): Promise<{
+        images: Float32Array;
+        imagesShape: number[];
+        labels: BigInt64Array;
     }> => {
-        const subscribe = websocket.subscribe;
         websocket.sendMessage(
             encodeEnvelope({ type: "request_batch", data: {}, raw: {} })
         );
-        const { images, labels } = await waitFor(subscribe, envelope => {
-            if (envelope.type !== "batch") return undefined;
-            const imagesShape = envelope.data.images_shape as number[];
-            const labelsShape = envelope.data.labels_shape as number[];
-            const images = new Tensor(
-                "float32",
-                b64ToArray(envelope.raw.images, "float32") as Float32Array,
-                imagesShape
-            );
-            const labels = new Tensor(
-                "int64",
-                b64ToArray(envelope.raw.labels, "int64") as BigInt64Array,
-                labelsShape
-            );
-            return { images, labels };
-        });
-        return { images, labels };
+        return await waitFor(
+            websocket.subscribe,
+            envelope => {
+                if (envelope.type !== "batch") return undefined;
+                const imagesShape = envelope.data.images_shape as number[];
+                return {
+                    images: float32FromB64(envelope.raw.images),
+                    imagesShape,
+                    labels: int64FromB64(envelope.raw.labels)
+                };
+            },
+            signal
+        );
     };
 
     const sendActivationsAndAwaitGrads = async (
-        activations: Tensor,
-        labels: Tensor
-    ): Promise<{ upstreamGrad: Tensor; loss: number }> => {
+        activationsNchw: Float32Array,
+        activationsShape: number[],
+        labels: BigInt64Array,
+        signal: AbortSignal
+    ): Promise<{ upstreamGrad: Float32Array; loss: number }> => {
         websocket.sendMessage(
             encodeEnvelope({
                 type: "activations_and_labels",
-                data: { tensor_shape: activations.dims },
+                data: { tensor_shape: activationsShape },
                 raw: {
-                    tensor: tensorToB64(activations),
-                    labels: tensorToB64(labels)
+                    tensor: float32ToB64(activationsNchw),
+                    labels: int64ToB64(labels)
                 }
             })
         );
-
-        const result = await waitFor(websocket.subscribe, envelope => {
-            if (envelope.type !== "grads") return undefined;
-            const shape = envelope.data.tensor_shape as number[];
-            const upstreamGrad = new Tensor(
-                "float32",
-                b64ToArray(envelope.raw.tensor, "float32") as Float32Array,
-                shape
-            );
-            const lossValue = Number(envelope.data.loss);
-            return { upstreamGrad, loss: lossValue };
-        });
-
-        return result;
+        return await waitFor(
+            websocket.subscribe,
+            envelope => {
+                if (envelope.type !== "grads") return undefined;
+                return {
+                    upstreamGrad: float32FromB64(envelope.raw.tensor),
+                    loss: Number(envelope.data.loss)
+                };
+            },
+            signal
+        );
     };
 
     const start = async () => {
         if (status.value === "training") return;
-        let phase: string = "init";
+        let phase = "init";
+        abortController?.abort(); // belt+braces: cancel anything stale
+        abortController = new AbortController();
+        const { signal } = abortController;
         try {
-            const s = await ensureSession();
+            const model = ensureModel();
             status.value = "training";
             error.value = null;
             epoch.value = 0;
@@ -179,52 +203,53 @@ export const useTrainingStore = defineStore("training", () => {
             lossHistory.value = [];
 
             while (epoch.value < epochs.value) {
+                if (signal.aborted) throw new Error("aborted");
                 phase = "request_batch";
-                const { images, labels } = await requestBatch();
-                const batchSize = images.dims[0];
+                const { images, imagesShape, labels } = await requestBatch(signal);
+                const batchSize = imagesShape[0];
+                if (batchesPerEpoch.value === 0) {
+                    batchesPerEpoch.value = Math.ceil(60000 / batchSize);
+                }
 
-                phase = "lazy_reset_grad";
-                await s.lazyResetGrad();
-
-                // Forward only — we need the activations to ship to the server.
-                phase = "run_eval_step";
-                const evalOut = await s.runEvalStep({
-                    image: images,
-                    upstream_signal: zerosLikeActivations(batchSize)
-                });
-                const activations = evalOut["activations"] as Tensor;
-                if (!activations) {
-                    throw new Error(
-                        `eval_model produced no "activations" output. Outputs: ${Object.keys(
-                            evalOut
-                        ).join(", ")}`
-                    );
+                // Build the input tensor once for both forward + backward.
+                // tf.tidy() in trainStep/forward handles intermediate cleanup.
+                phase = "forward";
+                const imagesTensor = tensorFromFloat32(images, imagesShape);
+                let activationsNchw: Float32Array;
+                let activationsShape: number[];
+                const activationsTensor = model.forward(imagesTensor);
+                try {
+                    activationsShape = activationsTensor.shape.slice();
+                    activationsNchw = (await activationsTensor.data()) as Float32Array;
+                } finally {
+                    activationsTensor.dispose();
                 }
 
                 phase = "send_activations_and_labels";
                 const { upstreamGrad, loss: lossValue } =
-                    await sendActivationsAndAwaitGrads(activations, labels);
+                    await sendActivationsAndAwaitGrads(
+                        activationsNchw,
+                        activationsShape,
+                        labels,
+                        signal
+                    );
 
-                // Backward + optimizer using the real upstream gradient.
-                phase = "run_train_step";
-                await s.runTrainStep({
-                    image: images,
-                    upstream_signal: upstreamGrad
-                });
-                phase = "run_optimizer_step";
-                await s.runOptimizerStep();
+                phase = "backward";
+                const upstreamShape: [number, number, number, number] = [
+                    batchSize,
+                    ...model.activationDimsNchw
+                ];
+                const upstreamTensor = tensorFromFloat32(upstreamGrad, upstreamShape);
+                try {
+                    model.trainStep(imagesTensor, upstreamTensor);
+                } finally {
+                    upstreamTensor.dispose();
+                    imagesTensor.dispose();
+                }
 
                 loss.value = lossValue;
                 lossHistory.value.push(lossValue);
                 batch.value += 1;
-
-                // We don't know the true MNIST batches-per-epoch until the
-                // server tells us via the labels' shape — but since the
-                // server's MNIST loader is fixed at 60k samples and
-                // batch_size=128, that's 469 batches. We track for display.
-                if (batchesPerEpoch.value === 0) {
-                    batchesPerEpoch.value = Math.ceil(60000 / batchSize);
-                }
                 if (batch.value >= batchesPerEpoch.value) {
                     epoch.value += 1;
                     batch.value = 0;
@@ -234,49 +259,57 @@ export const useTrainingStore = defineStore("training", () => {
             status.value = "done";
         } catch (e) {
             status.value = "error";
-            // eslint-disable-next-line no-console
-            console.error(
-                "[training] failed during phase=%s epoch=%d batch=%d",
-                phase,
-                epoch.value,
-                batch.value
-            );
-            error.value = `phase=${phase} epoch=${epoch.value} batch=${batch.value}: ${describeError(
-                e
-            )}`;
+            const aborted = e instanceof Error && e.message === "aborted";
+            if (aborted) {
+                error.value = `Training stopped — WebSocket dropped at epoch ${epoch.value + 1}/${epochs.value}, batch ${batch.value}/${batchesPerEpoch.value || "?"}. Reconnect, then click Try again. (Click increases the chance of training-graph drift; for a clean restart click Reset first.)`;
+            } else {
+                // eslint-disable-next-line no-console
+                console.error(
+                    "[training] failed during phase=%s epoch=%d batch=%d",
+                    phase,
+                    epoch.value,
+                    batch.value
+                );
+                error.value = `phase=${phase} epoch=${epoch.value} batch=${batch.value}: ${describeError(e)}`;
+            }
         }
     };
 
-    const runInference = async (input: Tensor): Promise<Tensor> => {
-        const s = await ensureSession();
-        const batchSize = input.dims[0];
-        const evalOut = await s.runEvalStep({
-            image: input,
-            upstream_signal: zerosLikeActivations(batchSize)
-        });
-        const activations = evalOut["activations"] as Tensor;
-        if (!activations) {
-            throw new Error(
-                `eval_model produced no "activations" output. Outputs: ${Object.keys(
-                    evalOut
-                ).join(", ")}`
-            );
+    /** Forward-only pass for post-training inference. Returns NCHW activations. */
+    const runInference = async (
+        imageNchw: Float32Array,
+        shape: number[]
+    ): Promise<{ activations: Float32Array; shape: number[] }> => {
+        const model = ensureModel();
+        const input = tensorFromFloat32(imageNchw, shape);
+        const out = model.forward(input);
+        try {
+            const data = (await out.data()) as Float32Array;
+            return { activations: data, shape: out.shape.slice() };
+        } finally {
+            out.dispose();
+            input.dispose();
         }
-        return activations;
     };
 
     const reset = () => {
-        session.value = null;
+        abortController?.abort();
+        abortController = null;
+        if (client.value) {
+            client.value.dispose();
+            client.value = null;
+        }
         status.value = "idle";
         error.value = null;
         epoch.value = 0;
         batch.value = 0;
+        batchesPerEpoch.value = 0;
         loss.value = null;
         lossHistory.value = [];
     };
 
     return {
-        session,
+        client,
         status,
         error,
         epochs,
@@ -285,6 +318,7 @@ export const useTrainingStore = defineStore("training", () => {
         batchesPerEpoch,
         loss,
         lossHistory,
+        learningRate,
         start,
         runInference,
         reset

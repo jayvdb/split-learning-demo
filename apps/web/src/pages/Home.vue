@@ -64,6 +64,18 @@ const sendActivationsForInference = (output: Tensor) => {
     websocket.sendMessage(bytes);
 };
 
+const sendRawActivationsForInference = (data: Float32Array, shape: number[]) => {
+    const message = {
+        type: "activations",
+        data: { tensor_shape: shape },
+        raw: { tensor: serializeTensor(new Tensor("float32", data, shape)) }
+    };
+    const json = JSON.stringify(message);
+    const b64 = btoa(json);
+    const encoder = new TextEncoder();
+    websocket.sendMessage(encoder.encode(b64));
+};
+
 watch(
     [imageData, () => onnx.session, () => training.status],
     async () => {
@@ -87,8 +99,11 @@ watch(
             sendActivationsForInference(output);
         } else if (modelType === "splitnn-train") {
             if (training.status !== "done") return;
-            const activations = await training.runInference(input as any);
-            sendActivationsForInference(activations as any);
+            const { activations, shape } = await training.runInference(
+                normalized,
+                [1, 1, 28, 28]
+            );
+            sendRawActivationsForInference(activations, shape);
         }
     }
 );
@@ -135,10 +150,10 @@ watchEffect(() => {
     if (!model.value) return;
 
     if (model.value.type === "splitnn-train") {
-        // The browser-trained client loads its weights via the ORT
-        // TrainingSession, not the inference ONNX store. We do NOT auto-start
-        // training — TrainingProgress.vue surfaces a "Start training" button
-        // so the action is discoverable.
+        // The browser-trained client lives in the TF.js training store, not
+        // the inference ONNX store. We do NOT auto-start training —
+        // TrainingProgress.vue surfaces a "Start training" button so the
+        // action is discoverable.
     } else {
         // Drop any in-memory training state when switching to a non-training
         // model so the user can flip back and forth without stale UI.
@@ -188,19 +203,6 @@ watchEffect(() => {
                     placeholder="Enter server URL"
                     :error="websocket.status === 'closed' ? 'Connection failed' : ''"
                     v-model:value="parameterServer"
-                    class="mb-4"
-                />
-                <Input
-                    v-if="isSplitnnTrain"
-                    label="Epochs"
-                    type="number"
-                    :value="String(training.epochs)"
-                    @update:value="
-                        (v: string) => {
-                            const n = Number(v);
-                            if (Number.isFinite(n) && n >= 1 && n <= 50) training.epochs = n;
-                        }
-                    "
                     class="mb-4"
                 />
                 <Button class="mb-4" @click="() => connect(parameterServer)">Reconnect</Button>

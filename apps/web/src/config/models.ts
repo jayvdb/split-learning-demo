@@ -9,7 +9,7 @@ export const models: Record<string, ModelConfig[]> = {
     mnist: [
         { name: "LeNet-5 SplitNN", path: "/models/client_mnist.onnx", type: "splitnn" },
         {
-            name: "LeNet-5 SplitNN (Train in Browser)",
+            name: "LeNet-5 SplitNN (Train using TF.js)",
             path: "/models/training/",
             type: "splitnn-train"
         },

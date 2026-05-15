@@ -1,67 +1,126 @@
-import { TrainingSession, Tensor, env } from "onnxruntime-web/training";
+import * as tf from "@tensorflow/tfjs";
 
-const TRAINING_ARTIFACT_DIR = "/models/training";
+// CNN2DClient (cut after conv2 + relu + pool ×2):
+//   Input  NCHW (B, 1, 28, 28)
+//   Conv2d(1→6, 5×5, padding=same) → ReLU → MaxPool(2×2)
+//   Conv2d(6→16, 5×5, padding=same) → ReLU → MaxPool(2×2)
+//   Output NCHW (B, 16, 7, 7)
+//
+// TF.js layers default to NHWC. We expose the public API in NCHW so the
+// rest of the app (and the existing WebSocket protocol) doesn't have to
+// know about the layout difference — the transpose is local to this file.
 
-export interface TrainingArtifactPaths {
-    checkpointState: string;
-    trainModel: string;
-    evalModel: string;
-    optimizerModel: string;
+const ACTIVATION_DIMS_NCHW: [number, number, number] = [16, 7, 7];
+const ACTIVATION_DIMS_NHWC: [number, number, number] = [7, 7, 16];
+
+export interface ClientModel {
+    /** Forward pass. Input NCHW (B,1,28,28) → activations NCHW (B,16,7,7). */
+    forward(imagesNchw: tf.Tensor4D): tf.Tensor4D;
+    /**
+     * Split-learning train step. Builds the chain-rule loss
+     * `sum(activations · upstreamGrad)`, lets tfjs autograd backprop, and
+     * applies an SGD update. Returns the chain-rule loss scalar (mainly
+     * useful as a "did the gradient flow" liveness check; the meaningful
+     * server-side cross-entropy loss arrives separately in the GRADS
+     * envelope).
+     */
+    trainStep(imagesNchw: tf.Tensor4D, upstreamGradNchw: tf.Tensor4D): number;
+    /** Sequential model — exposed so the store can `.dispose()` on reset. */
+    dispose(): void;
+    /** Update the optimizer's learning rate without re-creating the model. */
+    setLearningRate(lr: number): void;
+    readonly activationDimsNchw: readonly [number, number, number];
 }
 
-export const defaultArtifactPaths = (
-    base: string = TRAINING_ARTIFACT_DIR
-): TrainingArtifactPaths => ({
-    checkpointState: `${base}/checkpoint`,
-    trainModel: `${base}/training_model.onnx`,
-    evalModel: `${base}/eval_model.onnx`,
-    optimizerModel: `${base}/optimizer_model.onnx`
-});
+const buildSequential = (): tf.LayersModel =>
+    tf.sequential({
+        layers: [
+            tf.layers.conv2d({
+                inputShape: [28, 28, 1],
+                filters: 6,
+                kernelSize: 5,
+                padding: "same"
+            }),
+            tf.layers.activation({ activation: "relu" }),
+            tf.layers.maxPooling2d({ poolSize: 2, strides: 2 }),
+            tf.layers.conv2d({ filters: 16, kernelSize: 5, padding: "same" }),
+            tf.layers.activation({ activation: "relu" }),
+            tf.layers.maxPooling2d({ poolSize: 2, strides: 2 })
+        ]
+    });
 
-export const createTrainingSession = async (
-    artifactPaths: TrainingArtifactPaths = defaultArtifactPaths(),
-    opts: { skipOptimizer?: boolean } = {}
-): Promise<TrainingSession> => {
-    // onnxruntime-web/training loads the wasm runtime + worker scripts from
-    // the same origin; vite.config.ts copies them to the site root.
-    env.wasm.wasmPaths = "/";
-    // Bubble ORT's own error/warning messages to the JS console so wasm-side
-    // failures (which otherwise surface as opaque numeric exception
-    // pointers) come with a readable message attached.
-    env.logLevel = "warning";
-    env.debug = true;
+export const createClientModel = (learningRate: number = 0.01): ClientModel => {
+    const model = buildSequential();
+    const optimizer = tf.train.sgd(learningRate);
 
-    const create = (paths: TrainingArtifactPaths) =>
-        TrainingSession.create(paths, {
-            logSeverityLevel: 0, // VERBOSE
-            logVerbosityLevel: 0
+    const forward = (imagesNchw: tf.Tensor4D): tf.Tensor4D =>
+        tf.tidy(() => {
+            const imagesNhwc = tf.transpose(imagesNchw, [0, 2, 3, 1]);
+            const activationsNhwc = model.predict(imagesNhwc) as tf.Tensor4D;
+            return tf.transpose(activationsNhwc, [0, 3, 1, 2]) as tf.Tensor4D;
         });
 
-    if (opts.skipOptimizer) {
-        const { optimizerModel: _drop, ...withoutOpt } = artifactPaths;
-        return await create(withoutOpt as TrainingArtifactPaths);
-    }
+    const trainStep = (
+        imagesNchw: tf.Tensor4D,
+        upstreamGradNchw: tf.Tensor4D
+    ): number => {
+        // Hold the NHWC inputs across the minimize() closure so they're
+        // not freed mid-callback. We dispose them manually after.
+        const imagesNhwc = tf.transpose(imagesNchw, [0, 2, 3, 1]) as tf.Tensor4D;
+        const upstreamGradNhwc = tf.transpose(
+            upstreamGradNchw,
+            [0, 2, 3, 1]
+        ) as tf.Tensor4D;
 
-    try {
-        return await create(artifactPaths);
-    } catch (e) {
-        // ORT-web's stripped wasm build doesn't include all `com.microsoft`
-        // training-only contrib ops, and SGDOptimizerV2 — what onnxblock
-        // emits for the SGD optimizer — has been observed to throw an
-        // opaque emscripten exception here. Retry without the optimizer
-        // model so the caller can do the param update by hand. The session
-        // still exposes runTrainStep / runEvalStep.
-        // eslint-disable-next-line no-console
-        console.warn(
-            "[training] TrainingSession.create failed with optimizer model; retrying without it",
-            e
+        let lossValue = 0;
+        const lossScalar = optimizer.minimize(
+            () => {
+                const activationsNhwc = model.apply(imagesNhwc, {
+                    training: true
+                }) as tf.Tensor4D;
+                // Split-learning chain-rule loss:
+                //   d(sum(a*g))/d(params) = d(a)/d(params) · g
+                // — exactly the upstream-gradient propagation
+                // `torch.autograd.backward(activations, grads)` does in
+                // scripts/client.py.
+                return tf.sum(tf.mul(activationsNhwc, upstreamGradNhwc)) as tf.Scalar;
+            },
+            true /* returnCost */
         );
-        const { optimizerModel: _drop, ...withoutOpt } = artifactPaths;
-        return await create(withoutOpt as TrainingArtifactPaths);
-    }
+
+        if (lossScalar) {
+            lossValue = lossScalar.dataSync()[0];
+            lossScalar.dispose();
+        }
+        imagesNhwc.dispose();
+        upstreamGradNhwc.dispose();
+        return lossValue;
+    };
+
+    const dispose = () => {
+        model.dispose();
+    };
+
+    const setLearningRate = (lr: number) => {
+        // `tf.train.sgd(...)` returns an `SGDOptimizer` with a
+        // `setLearningRate` method; the abstract base type doesn't declare
+        // it, hence the narrowing cast.
+        (optimizer as unknown as { setLearningRate(lr: number): void }).setLearningRate(lr);
+    };
+
+    return {
+        forward,
+        trainStep,
+        dispose,
+        setLearningRate,
+        activationDimsNchw: ACTIVATION_DIMS_NCHW
+    };
 };
 
-export const zerosLikeActivations = (batch: number): Tensor =>
-    new Tensor("float32", new Float32Array(batch * 16 * 7 * 7), [batch, 16, 7, 7]);
+export const tensorFromFloat32 = (
+    data: Float32Array,
+    shape: number[]
+): tf.Tensor4D => tf.tensor4d(data, shape as [number, number, number, number]);
 
-export { Tensor };
+export { tf };
+void ACTIVATION_DIMS_NHWC;

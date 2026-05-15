@@ -78,10 +78,12 @@ class MnistBatchStream:
 
     def __init__(self, batch_size: int = 128, num_workers: int = 0) -> None:
         mnist_normalize = transforms.Normalize((0.1307,), (0.3081,))
+        # No augmentation. `scripts/client.py` uses RandomCrop+RandomRotation
+        # and trains for 50 epochs to absorb it; the browser-trained client
+        # defaults to 3 epochs and will see un-augmented digits at inference,
+        # so the augmentation just slows convergence here.
         train_transform = transforms.Compose(
             [
-                transforms.RandomCrop(28, padding=4),
-                transforms.RandomRotation(10),
                 transforms.ToTensor(),
                 mnist_normalize,
             ]
@@ -101,19 +103,27 @@ class MnistBatchStream:
         self._batches_this_epoch = 0
 
     def next(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # Wrap the loader. StopIteration only fires when the *next* request
+        # arrives after a full pass — we can't use it as the epoch-complete
+        # signal because the browser will stop requesting at the end of its
+        # final epoch, leaving the last completion silently un-logged.
         try:
             data = next(self._iter)
         except StopIteration:
+            self._iter = iter(self._loader)
+            data = next(self._iter)
+            self._batches_this_epoch = 0
+        self._batches_this_epoch += 1
+
+        # Log as we hand out the last batch of the epoch, not afterwards.
+        if self._batches_this_epoch == len(self._loader):
             self._epoch += 1
             _logger.info(
                 "Browser epoch %d complete (%d batches delivered)",
                 self._epoch,
                 self._batches_this_epoch,
             )
-            self._batches_this_epoch = 0
-            self._iter = iter(self._loader)
-            data = next(self._iter)
-        self._batches_this_epoch += 1
+
         return data["image"], data["label"]
 
 
