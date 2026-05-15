@@ -6,7 +6,7 @@ channels:
     # - huggingface
     # - xformers
     # - fastai
-    - plotly
+    # - plotly
     # - pyviz
     # - rapidsai
     - nvidia
@@ -18,14 +18,14 @@ dependencies:
     - pip
     # Common
     - numpy
-    - scipy
+    # - scipy
     - tqdm
     - click
-    - shapely
+    # - shapely
 
     # Dataframe
     # - polars
-    - pandas
+    # - pandas
     # - geopandas>=0.11
 
     # EDA
@@ -33,12 +33,12 @@ dependencies:
     # - ydata-profiling
 
     # Visualization
-    - matplotlib
-    - seaborn
+    # - matplotlib
+    # - seaborn
     # - ipympl
     # - altair
     # - yellowbrick
-    - plotly::plotly
+    # - plotly::plotly
     # - holoviews
     # - bokeh
     # - datashader
@@ -52,7 +52,7 @@ dependencies:
     # - panel
 
     # ML
-    - scikit-learn
+    # - scikit-learn
     # - imbalanced-learn
     # - xgboost
     # - catboost
@@ -93,12 +93,12 @@ dependencies:
     - datasets
     # - tokenizers
     # - evaluate
-    - einops
+    # - einops
 
     # Federated Learning
     # - syft
     # - flwr
-    - opacus
+    # - opacus
 
     # XAI
     # - lime
@@ -109,12 +109,12 @@ dependencies:
 
     # Hyperparameters
     # - skopt
-    - optuna
+    # - optuna
     # - hyperopt
 
     # Experiment tracking
-    - tensorboard
-    - wandb
+    # - tensorboard
+    # - wandb
     # - mlflow
     # - neptune-client
     # - hydra-core
@@ -133,7 +133,7 @@ dependencies:
     # - snakeviz
 
     # Data format engines
-    - pyarrow>=4.0
+    # - pyarrow>=4.0
     # - pynio
     # - cfgrib # grib2 files
     # - python-cdo # grib1/2 netCDF,... files
@@ -143,7 +143,7 @@ dependencies:
     # - python-multipart
     # - gdal<4.5 #They removed drivers requried by fiona for geopandas.
     # - fiona
-    - safetensors
+    # - safetensors
 
     # Webservers
     # - flask
@@ -160,21 +160,21 @@ dependencies:
     # - celery>=5.0
 
     # Security
-    - python-jose
-    - cryptography
+    # - python-jose
+    # - cryptography
 
     # Scraping / http clients
     # - beautifulsoup4
     # - fake-useragent
-    - httpx
+    # - httpx
     # - aiohttp
     - websockets
 
     # Utilities
-    - pyyaml
-    - arrow
-    - rich
-    - natsort
+    # - pyyaml
+    # - arrow
+    # - rich
+    # - natsort
     - bitarray
     # - cachetools
     # - astral
@@ -187,7 +187,7 @@ dependencies:
           # Pip only packages
           # - tensorflow
           # - tensorflow-probability
-          - flwr[simulation]
+          # - flwr[simulation]
           # - numpyro
           # - funsor
           # - icecream
