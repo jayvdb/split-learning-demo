@@ -67,6 +67,7 @@ dependencies:
     # - scikit-fuzzy
     - onnx
     - onnxruntime
+    - onnxscript
     - pytorch>=2.0.1
     - torchvision
     # - torchaudio
