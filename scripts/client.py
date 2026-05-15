@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -188,7 +189,14 @@ def main(
             _logger.error(e)
             raise e
 
-    asyncio.get_event_loop().run_until_complete(train_splitnn())
+    try:
+        asyncio.run(train_splitnn())
+    except RuntimeError:
+        # Fallback for environments that already have an event loop in the
+        # thread (notebooks, embedded interpreters, older asyncio entry
+        # points). Python 3.14 removed implicit loop creation from
+        # asyncio.get_event_loop(), so prefer asyncio.run() above.
+        asyncio.get_event_loop().run_until_complete(train_splitnn())
 
     client_onnx_path.parent.mkdir(parents=True, exist_ok=True)
     example_input = torch.zeros(1, 1, 28, 28, device=fabric.device)
@@ -209,4 +217,8 @@ def main(
 
 
 if __name__ == "__main__":
+    # Python 3.14 switched POSIX default to "forkserver", which pickles worker
+    # args; the HuggingFace dataset transform is a local closure and isn't
+    # picklable. "fork" matches pre-3.14 behaviour.
+    multiprocessing.set_start_method("fork", force=True)
     main()
