@@ -71,7 +71,7 @@ dependencies:
     - pytorch>=2.0.1
     - torchvision
     # - torchaudio
-    - pytorch::pytorch-cuda=11.8
+    # pytorch::pytorch-cuda=11.8
     # - pytorch::cpuonly
     - lightning
     # - jax
@@ -183,6 +183,13 @@ dependencies:
     - pip:
           # install in editable mode
           - -e ./packages/split-learning-demo
+
+          # ORT Training (for generating browser-trainable artifacts via
+          # scripts/generate_training_artifacts.py). CPU-only wheel — the
+          # GPU wheel `onnxruntime-training` only exists for some CUDA
+          # combos. `onnxruntime-training-cpu` ships `onnxruntime.training`
+          # alongside the regular `onnxruntime` package.
+          - onnxruntime-training-cpu>=1.17
 
           # Pip only packages
           # - tensorflow

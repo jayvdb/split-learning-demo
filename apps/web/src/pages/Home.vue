@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import PlotFigure from "@/components/charts/PlotFigure.vue";
+import TrainingProgress from "@/components/TrainingProgress.vue";
 import DrawingCanvas from "@/components/inputs/DrawingCanvas.vue";
 import Button from "@/components/ui/Button.vue";
 import Input from "@/components/ui/Input.vue";
@@ -14,10 +15,11 @@ import {
 import { argmax, softmax } from "@/lib/utils/math";
 import { deserializeTensor, executionProviderConfig, serializeTensor } from "@/lib/utils/onnx";
 import { useOnnxStore } from "@/stores/onnx";
+import { useTrainingStore } from "@/stores/training";
 import { useWebsocketStore } from "@/stores/websocket";
 import * as Plot from "@observablehq/plot";
 import { Tensor } from "onnxruntime-web";
-import { ref, watch, watchEffect } from "vue";
+import { computed, ref, watch, watchEffect } from "vue";
 
 const canvasRef = ref<InstanceType<typeof DrawingCanvas> | null>(null);
 const imageData = ref<ImageData | null>(null);
@@ -30,6 +32,15 @@ const parameterServer = ref<string>("ws://127.0.0.1:8000/ws");
 
 const onnx = useOnnxStore();
 const websocket = useWebsocketStore();
+const training = useTrainingStore();
+
+const isSplitnnTrain = computed(() => model.value?.type === "splitnn-train");
+// We keep the progress panel visible for every state except "done" — that
+// includes "idle" so the Start button is reachable, and "error" so the
+// user can retry without having to switch models away and back.
+const inTrainingPhase = computed(
+    () => isSplitnnTrain.value && training.status !== "done"
+);
 
 // prediction
 const displayPrediction = (output: Tensor) => {
@@ -40,36 +51,47 @@ const displayPrediction = (output: Tensor) => {
     probabilities.value = proba;
     prediction.value = predicted;
 };
-watch([imageData, () => onnx.session], async () => {
-    if (!imageData.value || !onnx.session || onnx.modelLoading) return;
+const sendActivationsForInference = (output: Tensor) => {
+    const message = {
+        type: "activations",
+        data: { tensor_shape: output.dims },
+        raw: { tensor: serializeTensor(output) }
+    };
+    const json = JSON.stringify(message);
+    const b64 = btoa(json);
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(b64);
+    websocket.sendMessage(bytes);
+};
 
-    // preprocess
-    const rescaled = imageDataRescale(imageData.value, 28, 28);
-    const grayscale = imageDataToGrayscale(rescaled);
-    const f32array = imageDataToF32(grayscale);
-    const normalized = f32Normalize(f32array, [0.1307], [0.3081]);
-    const input = new Tensor("float32", normalized, [1, 1, 28, 28]);
+watch(
+    [imageData, () => onnx.session, () => training.status],
+    async () => {
+        if (!imageData.value) return;
 
-    const modelType = model.value?.type;
-    if (modelType === "local") {
-        const { output } = await onnx.runModel(input);
-        displayPrediction(output);
-    } else if (modelType === "splitnn") {
-        const { output } = await onnx.runModel(input);
-        const message = {
-            type: "activations",
-            data: { tensor_shape: output.dims },
-            raw: { tensor: serializeTensor(output) }
-        };
-        const json = JSON.stringify(message);
-        const b64 = btoa(json);
+        // preprocess
+        const rescaled = imageDataRescale(imageData.value, 28, 28);
+        const grayscale = imageDataToGrayscale(rescaled);
+        const f32array = imageDataToF32(grayscale);
+        const normalized = f32Normalize(f32array, [0.1307], [0.3081]);
+        const input = new Tensor("float32", normalized, [1, 1, 28, 28]);
 
-        const encoder = new TextEncoder();
-        const bytes = encoder.encode(b64);
-        console.log("Sending message prediction request...");
-        websocket.sendMessage(bytes);
+        const modelType = model.value?.type;
+        if (modelType === "local") {
+            if (!onnx.session || onnx.modelLoading) return;
+            const { output } = await onnx.runModel(input);
+            displayPrediction(output);
+        } else if (modelType === "splitnn") {
+            if (!onnx.session || onnx.modelLoading) return;
+            const { output } = await onnx.runModel(input);
+            sendActivationsForInference(output);
+        } else if (modelType === "splitnn-train") {
+            if (training.status !== "done") return;
+            const activations = await training.runInference(input as any);
+            sendActivationsForInference(activations as any);
+        }
     }
-});
+);
 const saveImage = (data: ImageData) => {
     imageData.value = data;
 };
@@ -112,7 +134,17 @@ watchEffect(() => {
     selectModel(model.value?.path);
     if (!model.value) return;
 
-    onnx.loadModel(model.value.path);
+    if (model.value.type === "splitnn-train") {
+        // The browser-trained client loads its weights via the ORT
+        // TrainingSession, not the inference ONNX store. We do NOT auto-start
+        // training — TrainingProgress.vue surfaces a "Start training" button
+        // so the action is discoverable.
+    } else {
+        // Drop any in-memory training state when switching to a non-training
+        // model so the user can flip back and forth without stale UI.
+        if (training.status !== "idle") training.reset();
+        onnx.loadModel(model.value.path);
+    }
 });
 </script>
 
@@ -158,9 +190,23 @@ watchEffect(() => {
                     v-model:value="parameterServer"
                     class="mb-4"
                 />
+                <Input
+                    v-if="isSplitnnTrain"
+                    label="Epochs"
+                    type="number"
+                    :value="String(training.epochs)"
+                    @update:value="
+                        (v: string) => {
+                            const n = Number(v);
+                            if (Number.isFinite(n) && n >= 1 && n <= 50) training.epochs = n;
+                        }
+                    "
+                    class="mb-4"
+                />
                 <Button class="mb-4" @click="() => connect(parameterServer)">Reconnect</Button>
             </div>
-            <div class="flex flex-col items-center justify-center md:flex-row">
+            <TrainingProgress v-if="inTrainingPhase" />
+            <div v-else class="flex flex-col items-center justify-center md:flex-row">
                 <div class="flex flex-col items-start justify-end">
                     <div class="flex items-center justify-center">
                         <DrawingCanvas

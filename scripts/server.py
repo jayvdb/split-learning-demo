@@ -11,11 +11,14 @@ from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from onnx import numpy_helper
 from torch import nn
+from torch.utils.data import DataLoader
+from torchvision import transforms
 from uvicorn import Config, Server
 
 import split_learning
 from split_learning.models.vision.cnn_2d import CNN2D, CNN2DServer
 from split_learning.schemas.message import MessageType, WSMessage
+from split_learning.utils import datasets as datasets
 from split_learning.utils import utils
 from split_learning.utils.serde import (
     decode_message_b64,
@@ -62,6 +65,56 @@ def export_onnx(model: nn.Module, onnx_path: Path, example_input: torch.Tensor) 
         )
     finally:
         model.train(was_training)
+
+
+class MnistBatchStream:
+    """Endless iterator over MNIST training batches, lazily reset on exhaustion.
+
+    Each wraparound of the underlying ``DataLoader`` corresponds to one full
+    MNIST pass — i.e. one browser-side training epoch, since the browser
+    consumes batches one-for-one via ``REQUEST_BATCH``. We log on wraparound
+    so the server-side console shows epoch boundaries.
+    """
+
+    def __init__(self, batch_size: int = 128, num_workers: int = 0) -> None:
+        mnist_normalize = transforms.Normalize((0.1307,), (0.3081,))
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(28, padding=4),
+                transforms.RandomRotation(10),
+                transforms.ToTensor(),
+                mnist_normalize,
+            ]
+        )
+        self._dataset = datasets.mnist(split="train", transform=train_transform)
+        # num_workers=0 keeps the DataLoader in-process. Background workers
+        # would need to pickle the dataset, but the HuggingFace transform is
+        # a local closure (defined inside `datasets.dataset_loader`); under
+        # Python 3.14's new `forkserver` POSIX default that pickle fails.
+        # We serve at most one batch per WebSocket request so prefetching
+        # isn't worth the workaround.
+        self._loader = DataLoader(
+            self._dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+        )
+        self._iter = iter(self._loader)
+        self._epoch = 0
+        self._batches_this_epoch = 0
+
+    def next(self) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            data = next(self._iter)
+        except StopIteration:
+            self._epoch += 1
+            _logger.info(
+                "Browser epoch %d complete (%d batches delivered)",
+                self._epoch,
+                self._batches_this_epoch,
+            )
+            self._batches_this_epoch = 0
+            self._iter = iter(self._loader)
+            data = next(self._iter)
+        self._batches_this_epoch += 1
+        return data["image"], data["label"]
 
 
 class ConnectionManager:
@@ -187,6 +240,15 @@ def main(
     criterion = nn.CrossEntropyLoss()
     model, optimizer = fabric.setup(model, optimizer)
 
+    batch_stream: MnistBatchStream | None = None
+
+    def get_batch_stream() -> MnistBatchStream:
+        nonlocal batch_stream
+        if batch_stream is None:
+            _logger.info("Initialising MNIST batch stream for browser training...")
+            batch_stream = MnistBatchStream(batch_size=128)
+        return batch_stream
+
     @app.websocket("/ws", api_prefix)
     async def websocket_endpoint(websocket: WebSocket):
         await manager.connect(websocket)
@@ -227,6 +289,24 @@ def main(
                         type=MessageType.GRADS,
                         data={"tensor_shape": grads.shape, "loss": loss.item()},
                         raw={"tensor": serialized_grads},
+                    )
+                    encoded_response = encode_message_b64(response_message)
+                    await websocket.send_bytes(encoded_response)
+                elif message.type == MessageType.REQUEST_BATCH:
+                    images, labels = get_batch_stream().next()
+
+                    serialized_images = serialize_tensor(images.cpu())
+                    serialized_labels = serialize_tensor(labels.cpu())
+                    response_message = WSMessage(
+                        type=MessageType.BATCH,
+                        data={
+                            "images_shape": list(images.shape),
+                            "labels_shape": list(labels.shape),
+                        },
+                        raw={
+                            "images": serialized_images,
+                            "labels": serialized_labels,
+                        },
                     )
                     encoded_response = encode_message_b64(response_message)
                     await websocket.send_bytes(encoded_response)

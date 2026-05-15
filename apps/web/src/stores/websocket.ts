@@ -1,11 +1,19 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 
+type MessageListener = (data: string) => void;
+
 export const useWebsocketStore = defineStore("websockets", () => {
     const socket = ref<WebSocket | undefined>(undefined);
     const status = ref<"connecting" | "open" | "closed">("closed");
     const url = computed(() => socket.value?.url);
     const errors = ref<Event[]>([]);
+    const listeners = ref<Set<MessageListener>>(new Set());
+
+    const subscribe = (listener: MessageListener) => {
+        listeners.value.add(listener);
+        return () => listeners.value.delete(listener);
+    };
 
     const disconnect = () => {
         if (socket.value) socket.value.close();
@@ -14,12 +22,17 @@ export const useWebsocketStore = defineStore("websockets", () => {
         url: string,
         options?: {
             onOpen?: () => void;
-            onMessage?: (data: string) => void;
+            onMessage?: MessageListener;
             onClose?: () => void;
             onError?: (error: Event) => void;
         }
     ) => {
         const websocket = new WebSocket(url);
+
+        const dispatch = (decoded: string) => {
+            options?.onMessage?.(decoded);
+            for (const listener of listeners.value) listener(decoded);
+        };
 
         websocket.onopen = () => {
             status.value = "open";
@@ -29,17 +42,13 @@ export const useWebsocketStore = defineStore("websockets", () => {
             const data = event.data;
 
             if (typeof data === "string") {
-                options?.onMessage?.(data);
+                dispatch(data);
             } else if (data instanceof ArrayBuffer) {
                 const decoder = new TextDecoder();
-                const decoded = decoder.decode(data);
-                options?.onMessage?.(decoded);
+                dispatch(decoder.decode(data));
             } else if (data instanceof Blob) {
                 const reader = new FileReader();
-                reader.onload = () => {
-                    const decoded = reader.result as string;
-                    options?.onMessage?.(decoded);
-                };
+                reader.onload = () => dispatch(reader.result as string);
                 reader.readAsText(data);
             }
         };
@@ -69,6 +78,7 @@ export const useWebsocketStore = defineStore("websockets", () => {
         errors,
         connect,
         sendMessage,
-        disconnect
+        disconnect,
+        subscribe
     };
 });

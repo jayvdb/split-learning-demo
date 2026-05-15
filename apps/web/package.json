@@ -21,7 +21,7 @@
         "@vueuse/core": "^10.3.0",
         "motion": "^10.16.2",
         "oh-vue-icons": "1.0.0-rc3",
-        "onnxruntime-web": "^1.15.1",
+        "onnxruntime-web": "^1.19.0",
         "pinia": "^2.1.6",
         "vue": "^3.3.4",
         "vue-router": "^4.2.4"

@@ -12,6 +12,8 @@ class MessageType(str, Enum):
     GRADS = "grads"
     LABELS = "labels"
     LOGITS = "logits"
+    REQUEST_BATCH = "request_batch"
+    BATCH = "batch"
 
 
 class WSMessage(BaseModel):

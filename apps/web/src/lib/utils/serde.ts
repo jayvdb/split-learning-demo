@@ -13,8 +13,22 @@ const dataTypes = {
 };
 
 export const arrayToB64 = (array: ArrayBufferView) => {
-    const bytes = new Uint8Array(array.buffer);
-    const binary = String.fromCharCode.apply(null, bytes as any);
+    // Use the view's own offset/length — TypedArrays returned from ORT may
+    // share an underlying buffer with other data.
+    const bytes = new Uint8Array(array.buffer, array.byteOffset, array.byteLength);
+    // `String.fromCharCode.apply(null, bytes)` passes every byte as a
+    // separate argument; on large payloads (the 400 KB training batches
+    // we ship over WS) that overflows V8's call stack. Chunk in
+    // 32 KB blocks — well under the limit, still only a handful of
+    // calls for typical inputs.
+    const CHUNK = 0x8000;
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(
+            null,
+            bytes.subarray(i, i + CHUNK) as unknown as number[]
+        );
+    }
     return btoa(binary);
 };
 

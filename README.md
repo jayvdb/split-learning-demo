@@ -84,6 +84,34 @@ To run the MPI demo with 1 server and 1 client:
 mpirun -n 2 python scripts/mpi.py --learning-rate=0.01
 ```
 
+## End-to-end smoke tests
+
+`scripts/smoke_test_ws.py` exercises the WebSocket protocol the way the
+browser does — useful for catching protocol regressions without a UI:
+
+```sh
+python scripts/server.py --learning-rate=0.01 &
+python scripts/smoke_test_ws.py
+```
+
+It connects, then verifies three round-trips:
+
+- `REQUEST_BATCH` → `BATCH` (a `(128,1,28,28)` MNIST image tensor plus
+  `(128,)` int64 labels — the data path the browser-trained client uses).
+- `ACTIVATIONS_AND_LABELS` → `GRADS` (the training path the server already
+  runs for `scripts/client.py`).
+- `ACTIVATIONS` → `LOGITS` (the inference path that powers the drawing
+  canvas).
+
+Exits 0 on success, 2 on a shape / loss assertion failure, 3 if it can't
+reach the server.
+
+The training-artifact pipeline has its own smoke step baked into
+`scripts/generate_training_artifacts.py` — after writing the four artifact
+files it loads them through `onnxruntime.training.api.Module` and runs one
+train+optimizer step on zero inputs, which catches IR-version drift and
+input-naming mismatches.
+
 ## TODO
 
 -   [x] Add a simple local baseline model for comparisons
