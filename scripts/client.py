@@ -202,6 +202,10 @@ def main(
             input_names=["input"],
             output_names=["output"],
             dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+            # Force the legacy TorchScript exporter: the dynamo path pulls in
+            # onnxscript's torchlib registry, which on Python 3.14 trips a
+            # `typing.Union` typeinfo check in onnxscript 0.5.6.dev*.
+            dynamo=False,
         )
     finally:
         unwrapped_model.train(was_training)
