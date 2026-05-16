@@ -24,9 +24,6 @@ const formattedLoss = computed(() =>
 const canStart = computed(
     () => training.status === "idle" || training.status === "error"
 );
-// Lock both widgets the moment the user clicks Start — covers both the
-// brief "loading" stage and the actual "training" loop. They re-open on
-// done / error / idle.
 const widgetsEditable = computed(
     () => training.status !== "training" && training.status !== "loading"
 );

@@ -68,22 +68,15 @@ def export_onnx(model: nn.Module, onnx_path: Path, example_input: torch.Tensor) 
 
 
 class MnistBatchStream:
-    """Endless iterator over MNIST training batches, lazily reset on exhaustion.
+    """Endless iterator over MNIST training batches for browser training.
 
-    Each wraparound of the underlying ``DataLoader`` corresponds to one full
-    MNIST pass — i.e. one browser-side training epoch, since the browser
-    consumes batches one-for-one via ``REQUEST_BATCH``. We log on wraparound
-    so the server-side console shows epoch boundaries.
+    Each ``DataLoader`` wrap = one browser-side training epoch (the browser
+    consumes batches 1:1 via ``REQUEST_BATCH``). Train transform matches
+    ``scripts/client.py`` exactly so the two clients are comparable.
     """
 
     def __init__(self, batch_size: int = 128, num_workers: int = 0) -> None:
         mnist_normalize = transforms.Normalize((0.1307,), (0.3081,))
-        # Match `scripts/client.py`'s train transform exactly. The
-        # RandomCrop+RandomRotation augmentation is what gives the trained
-        # client any chance of generalizing to off-center, slightly rotated
-        # hand-drawn digits on the canvas — without it the network only
-        # ever sees perfectly-centred MNIST glyphs and the inference path
-        # on a real drawing degrades hard.
         train_transform = transforms.Compose(
             [
                 transforms.RandomCrop(28, padding=4),
@@ -93,28 +86,17 @@ class MnistBatchStream:
             ]
         )
         self._dataset = datasets.mnist(split="train", transform=train_transform)
-        # num_workers=0 keeps the DataLoader in-process. Background workers
-        # would need to pickle the dataset, but the HuggingFace transform is
-        # a local closure (defined inside `datasets.dataset_loader`); under
-        # Python 3.14's new `forkserver` POSIX default that pickle fails.
-        # We serve at most one batch per WebSocket request so prefetching
-        # isn't worth the workaround.
+        # num_workers=0: HuggingFace's transform is a local closure and
+        # doesn't pickle under Python 3.14's forkserver POSIX default.
         self._loader = DataLoader(
             self._dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
         )
         self._iter = iter(self._loader)
         self._epoch = 0
         self._batches_this_epoch = 0
-        # Caller can register a hook that fires when an epoch completes so
-        # session-level training stats can flush at the same time as the
-        # data-loader's wraparound. Receives the 1-indexed epoch number.
         self.on_epoch_complete: list = []
 
     def next(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # Wrap the loader. StopIteration only fires when the *next* request
-        # arrives after a full pass — we can't use it as the epoch-complete
-        # signal because the browser will stop requesting at the end of its
-        # final epoch, leaving the last completion silently un-logged.
         try:
             data = next(self._iter)
         except StopIteration:
@@ -123,7 +105,8 @@ class MnistBatchStream:
             self._batches_this_epoch = 0
         self._batches_this_epoch += 1
 
-        # Log as we hand out the last batch of the epoch, not afterwards.
+        # Detect on the *last* batch of the epoch so the final epoch (the
+        # browser stops requesting after it) doesn't go silently un-logged.
         if self._batches_this_epoch == len(self._loader):
             self._epoch += 1
             _logger.info(
@@ -134,7 +117,7 @@ class MnistBatchStream:
             for cb in self.on_epoch_complete:
                 try:
                     cb(self._epoch)
-                except Exception as exc:  # pragma: no cover - never fatal
+                except Exception as exc:
                     _logger.warning("epoch hook failed: %s", exc)
 
         return data["image"], data["label"]
@@ -272,9 +255,9 @@ def main(
             batch_stream = MnistBatchStream(batch_size=128)
         return batch_stream
 
-    # Running diagnostics so we can compare a browser training run to a
-    # scripts/client.py run line-for-line. Reset per WS connection.
     class TrainingStats:
+        """Per-connection running stats; emits a log line on cadence + epoch boundary."""
+
         def __init__(self, log_every: int = 50) -> None:
             self.log_every = log_every
             self.batches = 0
@@ -310,24 +293,25 @@ def main(
         def _emit(self, label: str) -> None:
             if self.batches == 0:
                 return
-            avg_loss = self.loss_sum / self.batches
-            acc = self.correct / max(self.total, 1)
-            act_abs = self.act_abs_mean_sum / self.batches
-            grad_abs = self.grad_abs_mean_sum / self.batches
             _logger.info(
                 "[%s] batches=%d loss=%.4f acc=%.4f |act|=%.4f |grad|=%.6f",
                 label,
                 self.batches,
-                avg_loss,
-                acc,
-                act_abs,
-                grad_abs,
+                self.loss_sum / self.batches,
+                self.correct / max(self.total, 1),
+                self.act_abs_mean_sum / self.batches,
+                self.grad_abs_mean_sum / self.batches,
             )
+
+    # A session has to have done at least this many train steps before we
+    # treat it as a real training run and overwrite the on-disk weights.
+    # Stops a stray smoke-test connection (or a misclicked browser tab) from
+    # destroying a properly-trained model with a single bad batch.
+    MIN_BATCHES_TO_SAVE = 50
 
     @app.websocket("/ws", api_prefix)
     async def websocket_endpoint(websocket: WebSocket):
         await manager.connect(websocket)
-        trained_this_session = False
         stats = TrainingStats(log_every=50)
         epoch_hook = lambda n: stats.emit_epoch(n)
         try:
@@ -350,7 +334,6 @@ def main(
                     labels = labels.to(fabric.device)
 
                     model.train()
-                    trained_this_session = True
                     activations.requires_grad = True
                     outputs = model(activations)
                     loss = criterion(outputs, labels)
@@ -393,17 +376,12 @@ def main(
                     encoded_response = encode_message_b64(response_message)
                     await websocket.send_bytes(encoded_response)
                 elif message.type == MessageType.SAVE_CLIENT_MODEL:
-                    # Frontend TF.js model dump for offline inspection.
-                    # `data` is the topology + weight specs + training meta;
-                    # `raw["weights"]` is the concatenated Float32 weight
-                    # bytes in the order described by `data["weight_specs"]`.
                     import json
                     import time as _time
 
                     out_dir = utils.workspace_root_path() / "data/models"
                     out_dir.mkdir(parents=True, exist_ok=True)
-                    ts = int(_time.time())
-                    stem = out_dir / f"frontend_client_{ts}"
+                    stem = out_dir / f"frontend_client_{int(_time.time())}"
 
                     meta = {
                         "topology": message.data.get("topology"),
@@ -442,15 +420,38 @@ def main(
                     )
                     encoded_response = encode_message_b64(response_message)
                     await websocket.send_bytes(encoded_response)
+
+                    with torch.no_grad():
+                        probs = torch.softmax(logits, dim=-1)
+                        top_probs, top_classes = probs.topk(min(3, probs.shape[-1]), dim=-1)
+                        for i in range(logits.shape[0]):
+                            top3 = ", ".join(
+                                f"{int(c)}:{float(p):.2f}"
+                                for c, p in zip(top_classes[i], top_probs[i])
+                            )
+                            _logger.info(
+                                "Inference: predicted %d (p=%.3f) top3=[%s]",
+                                int(top_classes[i, 0]),
+                                float(top_probs[i, 0]),
+                                top3,
+                            )
         except WebSocketDisconnect:
             manager.disconnect(websocket)
             if batch_stream is not None and epoch_hook in batch_stream.on_epoch_complete:
                 batch_stream.on_epoch_complete.remove(epoch_hook)
             stats.emit_epoch("disconnect")
-            if trained_this_session:
+            if stats.batches >= MIN_BATCHES_TO_SAVE:
                 example_input = torch.zeros(1, 16, 7, 7, device=fabric.device)
                 export_onnx(unwrapped_model, server_onnx_path, example_input)
                 _logger.info(f"Saved trained server weights to {server_onnx_path}")
+            elif stats.batches > 0:
+                _logger.info(
+                    "Skipping server-weight save: only %d batches this session "
+                    "(threshold %d). Won't overwrite %s.",
+                    stats.batches,
+                    MIN_BATCHES_TO_SAVE,
+                    server_onnx_path,
+                )
         except Exception as e:
             if batch_stream is not None and epoch_hook in batch_stream.on_epoch_complete:
                 batch_stream.on_epoch_complete.remove(epoch_hook)
@@ -465,4 +466,12 @@ def main(
 
 
 if __name__ == "__main__":
+    # Python 3.14's new POSIX default is "forkserver", which pickles all
+    # subprocess args. HuggingFace's dataset transform is a local closure
+    # and won't pickle (also matches scripts/client.py). On top of that,
+    # forkserver leaves a `/mp-*` semaphore on the resource_tracker that
+    # gets logged as leaked at shutdown.
+    import multiprocessing
+
+    multiprocessing.set_start_method("fork", force=True)
     main()

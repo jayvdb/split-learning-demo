@@ -9,18 +9,10 @@ type Status = "idle" | "loading" | "training" | "done" | "error";
 const describeError = (e: unknown): string => {
     // eslint-disable-next-line no-console
     console.error("[training] error:", e);
-    if (e instanceof Error) {
-        // eslint-disable-next-line no-console
-        try {
-            console.error("[training] stack:", e.stack);
-        } catch {
-            /* ignore */
-        }
-        return `${e.name}: ${e.message}`;
-    }
+    if (e instanceof Error) return `${e.name}: ${e.message}`;
     if (typeof e === "string") return e;
     try {
-        return `${typeof e}: ${JSON.stringify(e)}`;
+        return JSON.stringify(e);
     } catch {
         return String(e);
     }
@@ -92,16 +84,14 @@ export const useTrainingStore = defineStore("training", () => {
     const status = ref<Status>("idle");
     const error = ref<string | null>(null);
 
-    const epochs = ref(3);
+    const epochs = ref(25);
     const epoch = ref(0);
     const batch = ref(0);
     const batchesPerEpoch = ref(0);
     const loss = ref<number | null>(null);
     const lossHistory = ref<number[]>([]);
-    // Client-side SGD learning rate. The user is expected to set this so it
-    // matches `scripts/server.py --learning-rate`; we don't forward it
-    // over the protocol because the server's optimizer is fixed at process
-    // start.
+    // Must be set to match `scripts/server.py --learning-rate`; not
+    // forwarded over the protocol (server's optimizer is fixed at startup).
     const learningRate = ref(0.01);
 
     const ensureModel = (): ClientModel => {
@@ -114,22 +104,12 @@ export const useTrainingStore = defineStore("training", () => {
         return client.value;
     };
 
-    // Live-update the optimizer's LR when the user edits the widget. Takes
-    // effect on the next train step; no need to dispose the model.
     watch(learningRate, lr => {
         if (client.value) client.value.setLearningRate(lr);
     });
 
-    // Each `start()` owns an AbortController so a WebSocket drop (or a
-    // user-triggered reset) can cancel any in-flight `waitFor` and let the
-    // loop exit cleanly instead of hanging forever.
     let abortController: AbortController | null = null;
 
-    // If the WebSocket drops while training is running, surface it as an
-    // error — the in-flight `waitFor` would otherwise hang forever and the
-    // panel would just sit there spinning with no explanation. The
-    // `inTrainingPhase` derivation in Home.vue includes the "error" state,
-    // so the panel stays visible.
     watch(
         () => websocket.status,
         wsStatus => {
@@ -198,7 +178,7 @@ export const useTrainingStore = defineStore("training", () => {
     const start = async () => {
         if (status.value === "training") return;
         let phase = "init";
-        abortController?.abort(); // belt+braces: cancel anything stale
+        abortController?.abort();
         abortController = new AbortController();
         const { signal } = abortController;
         try {
@@ -218,8 +198,6 @@ export const useTrainingStore = defineStore("training", () => {
                     batchesPerEpoch.value = Math.ceil(60000 / batchSize);
                 }
 
-                // Build the input tensor once for both forward + backward.
-                // tf.tidy() in trainStep/forward handles intermediate cleanup.
                 phase = "forward";
                 const imagesTensor = tensorFromFloat32(images, imagesShape);
                 let activationsNchw: Float32Array;
@@ -258,13 +236,8 @@ export const useTrainingStore = defineStore("training", () => {
                 lossHistory.value.push(lossValue);
                 batch.value += 1;
 
-                // Diagnostics — log every 50 batches and at epoch boundaries
-                // so a frontend run is comparable line-for-line to the
-                // server's running stats and a scripts/client.py run.
                 const totalBatch = epoch.value * batchesPerEpoch.value + batch.value;
                 if (totalBatch % 50 === 0) {
-                    const actAbs = meanAbs(activationsNchw);
-                    const gradAbs = meanAbs(upstreamGrad);
                     // eslint-disable-next-line no-console
                     console.info(
                         "[training] e=%d b=%d/%d loss=%.4f |act|=%.4f |grad|=%.6f",
@@ -272,8 +245,8 @@ export const useTrainingStore = defineStore("training", () => {
                         batch.value,
                         batchesPerEpoch.value,
                         lossValue,
-                        actAbs,
-                        gradAbs
+                        meanAbs(activationsNchw),
+                        meanAbs(upstreamGrad)
                     );
                 }
                 if (batch.value >= batchesPerEpoch.value) {
@@ -292,23 +265,14 @@ export const useTrainingStore = defineStore("training", () => {
             status.value = "done";
         } catch (e) {
             status.value = "error";
-            const aborted = e instanceof Error && e.message === "aborted";
-            if (aborted) {
-                error.value = `Training stopped — WebSocket dropped at epoch ${epoch.value + 1}/${epochs.value}, batch ${batch.value}/${batchesPerEpoch.value || "?"}. Reconnect, then click Try again. (Click increases the chance of training-graph drift; for a clean restart click Reset first.)`;
+            if (e instanceof Error && e.message === "aborted") {
+                error.value = `Training stopped — WebSocket dropped at epoch ${epoch.value + 1}/${epochs.value}, batch ${batch.value}/${batchesPerEpoch.value || "?"}. Reconnect, then click Try again.`;
             } else {
-                // eslint-disable-next-line no-console
-                console.error(
-                    "[training] failed during phase=%s epoch=%d batch=%d",
-                    phase,
-                    epoch.value,
-                    batch.value
-                );
                 error.value = `phase=${phase} epoch=${epoch.value} batch=${batch.value}: ${describeError(e)}`;
             }
         }
     };
 
-    /** Forward-only pass for post-training inference. Returns NCHW activations. */
     const runInference = async (
         imageNchw: Float32Array,
         shape: number[]
