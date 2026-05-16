@@ -78,12 +78,16 @@ class MnistBatchStream:
 
     def __init__(self, batch_size: int = 128, num_workers: int = 0) -> None:
         mnist_normalize = transforms.Normalize((0.1307,), (0.3081,))
-        # No augmentation. `scripts/client.py` uses RandomCrop+RandomRotation
-        # and trains for 50 epochs to absorb it; the browser-trained client
-        # defaults to 3 epochs and will see un-augmented digits at inference,
-        # so the augmentation just slows convergence here.
+        # Match `scripts/client.py`'s train transform exactly. The
+        # RandomCrop+RandomRotation augmentation is what gives the trained
+        # client any chance of generalizing to off-center, slightly rotated
+        # hand-drawn digits on the canvas — without it the network only
+        # ever sees perfectly-centred MNIST glyphs and the inference path
+        # on a real drawing degrades hard.
         train_transform = transforms.Compose(
             [
+                transforms.RandomCrop(28, padding=4),
+                transforms.RandomRotation(10),
                 transforms.ToTensor(),
                 mnist_normalize,
             ]
@@ -101,6 +105,10 @@ class MnistBatchStream:
         self._iter = iter(self._loader)
         self._epoch = 0
         self._batches_this_epoch = 0
+        # Caller can register a hook that fires when an epoch completes so
+        # session-level training stats can flush at the same time as the
+        # data-loader's wraparound. Receives the 1-indexed epoch number.
+        self.on_epoch_complete: list = []
 
     def next(self) -> tuple[torch.Tensor, torch.Tensor]:
         # Wrap the loader. StopIteration only fires when the *next* request
@@ -123,6 +131,11 @@ class MnistBatchStream:
                 self._epoch,
                 self._batches_this_epoch,
             )
+            for cb in self.on_epoch_complete:
+                try:
+                    cb(self._epoch)
+                except Exception as exc:  # pragma: no cover - never fatal
+                    _logger.warning("epoch hook failed: %s", exc)
 
         return data["image"], data["label"]
 
@@ -259,10 +272,64 @@ def main(
             batch_stream = MnistBatchStream(batch_size=128)
         return batch_stream
 
+    # Running diagnostics so we can compare a browser training run to a
+    # scripts/client.py run line-for-line. Reset per WS connection.
+    class TrainingStats:
+        def __init__(self, log_every: int = 50) -> None:
+            self.log_every = log_every
+            self.batches = 0
+            self.loss_sum = 0.0
+            self.correct = 0
+            self.total = 0
+            self.act_abs_mean_sum = 0.0
+            self.grad_abs_mean_sum = 0.0
+
+        def update(
+            self,
+            loss_val: float,
+            outputs: torch.Tensor,
+            labels: torch.Tensor,
+            activations: torch.Tensor,
+            grads: torch.Tensor,
+        ) -> None:
+            self.batches += 1
+            self.loss_sum += loss_val
+            with torch.no_grad():
+                pred = outputs.argmax(dim=-1)
+                self.correct += int((pred == labels).sum().item())
+                self.total += int(labels.numel())
+                self.act_abs_mean_sum += float(activations.detach().abs().mean().item())
+                self.grad_abs_mean_sum += float(grads.detach().abs().mean().item())
+
+            if self.batches % self.log_every == 0:
+                self._emit("running")
+
+        def emit_epoch(self, epoch_idx) -> None:
+            self._emit(f"epoch {epoch_idx}")
+
+        def _emit(self, label: str) -> None:
+            if self.batches == 0:
+                return
+            avg_loss = self.loss_sum / self.batches
+            acc = self.correct / max(self.total, 1)
+            act_abs = self.act_abs_mean_sum / self.batches
+            grad_abs = self.grad_abs_mean_sum / self.batches
+            _logger.info(
+                "[%s] batches=%d loss=%.4f acc=%.4f |act|=%.4f |grad|=%.6f",
+                label,
+                self.batches,
+                avg_loss,
+                acc,
+                act_abs,
+                grad_abs,
+            )
+
     @app.websocket("/ws", api_prefix)
     async def websocket_endpoint(websocket: WebSocket):
         await manager.connect(websocket)
         trained_this_session = False
+        stats = TrainingStats(log_every=50)
+        epoch_hook = lambda n: stats.emit_epoch(n)
         try:
             while True:
                 optimizer.zero_grad()
@@ -302,8 +369,13 @@ def main(
                     )
                     encoded_response = encode_message_b64(response_message)
                     await websocket.send_bytes(encoded_response)
+
+                    stats.update(loss.item(), outputs, labels, activations, grads)
                 elif message.type == MessageType.REQUEST_BATCH:
-                    images, labels = get_batch_stream().next()
+                    bs = get_batch_stream()
+                    if epoch_hook not in bs.on_epoch_complete:
+                        bs.on_epoch_complete.append(epoch_hook)
+                    images, labels = bs.next()
 
                     serialized_images = serialize_tensor(images.cpu())
                     serialized_labels = serialize_tensor(labels.cpu())
@@ -320,6 +392,35 @@ def main(
                     )
                     encoded_response = encode_message_b64(response_message)
                     await websocket.send_bytes(encoded_response)
+                elif message.type == MessageType.SAVE_CLIENT_MODEL:
+                    # Frontend TF.js model dump for offline inspection.
+                    # `data` is the topology + weight specs + training meta;
+                    # `raw["weights"]` is the concatenated Float32 weight
+                    # bytes in the order described by `data["weight_specs"]`.
+                    import json
+                    import time as _time
+
+                    out_dir = utils.workspace_root_path() / "data/models"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    ts = int(_time.time())
+                    stem = out_dir / f"frontend_client_{ts}"
+
+                    meta = {
+                        "topology": message.data.get("topology"),
+                        "weight_specs": message.data.get("weight_specs"),
+                        "training": message.data.get("training", {}),
+                        "format": message.data.get("format", "tfjs-layers-model"),
+                    }
+                    with open(f"{stem}.json", "w") as f:
+                        json.dump(meta, f, indent=2)
+                    with open(f"{stem}.weights.bin", "wb") as f:
+                        f.write(message.raw["weights"])
+
+                    _logger.info(
+                        "Saved frontend client model: %s.json (+ .weights.bin, %d bytes)",
+                        stem,
+                        len(message.raw["weights"]),
+                    )
                 elif message.type == MessageType.ACTIVATIONS:
                     activations = deserialize_tensor(
                         message.raw["tensor"], dtype=torch.float32
@@ -343,11 +444,16 @@ def main(
                     await websocket.send_bytes(encoded_response)
         except WebSocketDisconnect:
             manager.disconnect(websocket)
+            if batch_stream is not None and epoch_hook in batch_stream.on_epoch_complete:
+                batch_stream.on_epoch_complete.remove(epoch_hook)
+            stats.emit_epoch("disconnect")
             if trained_this_session:
                 example_input = torch.zeros(1, 16, 7, 7, device=fabric.device)
                 export_onnx(unwrapped_model, server_onnx_path, example_input)
                 _logger.info(f"Saved trained server weights to {server_onnx_path}")
         except Exception as e:
+            if batch_stream is not None and epoch_hook in batch_stream.on_epoch_complete:
+                batch_stream.on_epoch_complete.remove(epoch_hook)
             _logger.error(e)
             raise e
 

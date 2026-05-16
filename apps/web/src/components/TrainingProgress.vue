@@ -3,7 +3,7 @@ import PlotFigure from "@/components/charts/PlotFigure.vue";
 import Input from "@/components/ui/Input.vue";
 import { useTrainingStore } from "@/stores/training";
 import * as Plot from "@observablehq/plot";
-import { computed } from "vue";
+import { computed, ref } from "vue";
 
 const training = useTrainingStore();
 
@@ -50,6 +50,27 @@ const startLabel = computed(() => {
 const onStart = () => {
     if (training.status === "error") training.reset();
     training.start();
+};
+
+const sendModelStatus = ref<"idle" | "sending" | "sent" | "error">("idle");
+const sendModelInfo = ref<string>("");
+const canSendModel = computed(
+    () =>
+        training.status !== "idle" &&
+        training.status !== "loading" &&
+        sendModelStatus.value !== "sending"
+);
+const onSendModel = async () => {
+    sendModelStatus.value = "sending";
+    sendModelInfo.value = "";
+    try {
+        const { bytes } = await training.saveModelToServer();
+        sendModelStatus.value = "sent";
+        sendModelInfo.value = `Sent ${bytes.toLocaleString()} weight bytes. Server should have written data/models/frontend_client_<ts>.{json,weights.bin}.`;
+    } catch (e) {
+        sendModelStatus.value = "error";
+        sendModelInfo.value = e instanceof Error ? e.message : String(e);
+    }
 };
 
 const onEpochs = (v: string) => {
@@ -154,5 +175,38 @@ const onLearningRate = (v: string) => {
                 marks: [Plot.lineY(training.lossHistory)]
             }"
         />
+
+        <div class="mt-2 flex flex-col gap-2 border-t border-base-300 pt-3">
+            <div class="flex flex-wrap items-center gap-3">
+                <button
+                    type="button"
+                    class="rounded-lg border border-base-300 px-3 py-1.5 text-sm transition hover:scale-95 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:scale-100"
+                    :disabled="!canSendModel"
+                    @click="onSendModel"
+                >
+                    {{
+                        sendModelStatus === "sending"
+                            ? "Sending…"
+                            : "Send model to server for inspection"
+                    }}
+                </button>
+                <span
+                    v-if="sendModelInfo"
+                    class="text-xs"
+                    :class="
+                        sendModelStatus === 'error'
+                            ? 'text-error'
+                            : 'text-base-content text-opacity-70'
+                    "
+                >
+                    {{ sendModelInfo }}
+                </span>
+            </div>
+            <p class="text-xs text-base-content text-opacity-60">
+                Dumps the in-memory TF.js client weights over the WS to
+                <code>data/models/frontend_client_&lt;ts&gt;.{json,weights.bin}</code>.
+                Inspect with <code>scripts/inspect_frontend_model.py</code>.
+            </p>
+        </div>
     </section>
 </template>

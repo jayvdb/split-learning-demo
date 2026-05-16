@@ -29,8 +29,31 @@ export interface ClientModel {
     dispose(): void;
     /** Update the optimizer's learning rate without re-creating the model. */
     setLearningRate(lr: number): void;
+    /**
+     * Dump the model weights for inspection. Returns the artifacts in the
+     * tfjs-layers `IOHandler` save format: JSON-able topology + weight
+     * specs, and a single concatenated Float32 ArrayBuffer of weight bytes.
+     */
+    exportArtifacts(): Promise<{
+        topology: unknown;
+        weightSpecs: tf.io.WeightsManifestEntry[];
+        weightData: ArrayBuffer;
+        format?: string | null;
+        generatedBy?: string | null;
+        convertedBy?: string | null;
+    }>;
     readonly activationDimsNchw: readonly [number, number, number];
 }
+
+// Mirror `CNN2DClient` (= first two children of `CNN2D` in
+// packages/.../models/vision/cnn_2d.py) layer-for-layer:
+//   Conv2d(1→6, 5×5, padding=2) → ReLU → MaxPool(2×2) → Dropout(0.4)
+//   Conv2d(6→16, 5×5, padding=2) → ReLU → MaxPool(2×2) → Dropout(0.4)
+// The Dropout layers are only active under `model.apply(x, {training: true})`
+// — they short-circuit in `model.predict` / `model.apply(x)`. That matches
+// PyTorch's `model.train()` vs `model.eval()` behaviour. Without them we
+// optimize a different objective than `scripts/client.py` does.
+const CLIENT_DROPOUT = 0.4;
 
 const buildSequential = (): tf.LayersModel =>
     tf.sequential({
@@ -43,15 +66,20 @@ const buildSequential = (): tf.LayersModel =>
             }),
             tf.layers.activation({ activation: "relu" }),
             tf.layers.maxPooling2d({ poolSize: 2, strides: 2 }),
+            tf.layers.dropout({ rate: CLIENT_DROPOUT }),
             tf.layers.conv2d({ filters: 16, kernelSize: 5, padding: "same" }),
             tf.layers.activation({ activation: "relu" }),
-            tf.layers.maxPooling2d({ poolSize: 2, strides: 2 })
+            tf.layers.maxPooling2d({ poolSize: 2, strides: 2 }),
+            tf.layers.dropout({ rate: CLIENT_DROPOUT })
         ]
     });
 
 export const createClientModel = (learningRate: number = 0.01): ClientModel => {
     const model = buildSequential();
-    const optimizer = tf.train.sgd(learningRate);
+    // `scripts/client.py` uses `torch.optim.SGD(..., momentum=0.9)` — plain
+    // `tf.train.sgd` is *not* equivalent. Without momentum, 50 epochs of
+    // chain-rule training is much slower to converge.
+    const optimizer = tf.train.momentum(learningRate, 0.9);
 
     const forward = (imagesNchw: tf.Tensor4D): tf.Tensor4D =>
         tf.tidy(() => {
@@ -102,10 +130,49 @@ export const createClientModel = (learningRate: number = 0.01): ClientModel => {
     };
 
     const setLearningRate = (lr: number) => {
-        // `tf.train.sgd(...)` returns an `SGDOptimizer` with a
+        // `tf.train.momentum(...)` extends `SGDOptimizer`, which has a
         // `setLearningRate` method; the abstract base type doesn't declare
         // it, hence the narrowing cast.
         (optimizer as unknown as { setLearningRate(lr: number): void }).setLearningRate(lr);
+    };
+
+    const exportArtifacts: ClientModel["exportArtifacts"] = async () => {
+        // `tf.io.withSaveHandler` lets us intercept the save call and grab
+        // the artifacts directly instead of writing them to local-storage
+        // or a download. We dispatch the same artifacts the server expects.
+        let captured: tf.io.ModelArtifacts | null = null;
+        await model.save(
+            tf.io.withSaveHandler(async (artifacts: tf.io.ModelArtifacts) => {
+                captured = artifacts;
+                return {
+                    modelArtifactsInfo: {
+                        dateSaved: new Date(),
+                        modelTopologyType: "JSON"
+                    }
+                };
+            })
+        );
+        if (!captured) throw new Error("TF.js model.save did not invoke the handler");
+        const a = captured as tf.io.ModelArtifacts;
+        const weightData =
+            a.weightData instanceof ArrayBuffer
+                ? a.weightData
+                : a.weightData
+                  ? (a.weightData as ArrayBuffer[]).reduce((acc, buf) => {
+                        const merged = new Uint8Array(acc.byteLength + buf.byteLength);
+                        merged.set(new Uint8Array(acc), 0);
+                        merged.set(new Uint8Array(buf), acc.byteLength);
+                        return merged.buffer;
+                    }, new ArrayBuffer(0))
+                  : new ArrayBuffer(0);
+        return {
+            topology: a.modelTopology,
+            weightSpecs: a.weightSpecs ?? [],
+            weightData,
+            format: a.format,
+            generatedBy: a.generatedBy,
+            convertedBy: a.convertedBy
+        };
     };
 
     return {
@@ -113,6 +180,7 @@ export const createClientModel = (learningRate: number = 0.01): ClientModel => {
         trainStep,
         dispose,
         setLearningRate,
+        exportArtifacts,
         activationDimsNchw: ACTIVATION_DIMS_NCHW
     };
 };

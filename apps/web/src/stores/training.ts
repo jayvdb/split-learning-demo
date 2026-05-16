@@ -78,6 +78,13 @@ const int64FromB64 = (b64: string) => b64ToArray(b64, "int64") as BigInt64Array;
 const float32ToB64 = (a: Float32Array) => arrayToB64(a);
 const int64ToB64 = (a: BigInt64Array) => arrayToB64(a);
 
+const meanAbs = (arr: Float32Array): number => {
+    if (arr.length === 0) return 0;
+    let sum = 0;
+    for (let i = 0; i < arr.length; i++) sum += Math.abs(arr[i]);
+    return sum / arr.length;
+};
+
 export const useTrainingStore = defineStore("training", () => {
     const websocket = useWebsocketStore();
 
@@ -250,9 +257,35 @@ export const useTrainingStore = defineStore("training", () => {
                 loss.value = lossValue;
                 lossHistory.value.push(lossValue);
                 batch.value += 1;
+
+                // Diagnostics — log every 50 batches and at epoch boundaries
+                // so a frontend run is comparable line-for-line to the
+                // server's running stats and a scripts/client.py run.
+                const totalBatch = epoch.value * batchesPerEpoch.value + batch.value;
+                if (totalBatch % 50 === 0) {
+                    const actAbs = meanAbs(activationsNchw);
+                    const gradAbs = meanAbs(upstreamGrad);
+                    // eslint-disable-next-line no-console
+                    console.info(
+                        "[training] e=%d b=%d/%d loss=%.4f |act|=%.4f |grad|=%.6f",
+                        epoch.value + 1,
+                        batch.value,
+                        batchesPerEpoch.value,
+                        lossValue,
+                        actAbs,
+                        gradAbs
+                    );
+                }
                 if (batch.value >= batchesPerEpoch.value) {
                     epoch.value += 1;
                     batch.value = 0;
+                    // eslint-disable-next-line no-console
+                    console.info(
+                        "[training] epoch %d/%d done; last loss=%.4f",
+                        epoch.value,
+                        epochs.value,
+                        lossValue
+                    );
                 }
             }
 
@@ -292,6 +325,46 @@ export const useTrainingStore = defineStore("training", () => {
         }
     };
 
+    const saveModelToServer = async (): Promise<{ bytes: number }> => {
+        const model = client.value;
+        if (!model) throw new Error("No client model in memory — train first");
+        const artifacts = await model.exportArtifacts();
+        const weightBytes = new Uint8Array(artifacts.weightData);
+        websocket.sendMessage(
+            encodeEnvelope({
+                type: "save_client_model",
+                data: {
+                    topology: artifacts.topology,
+                    weight_specs: artifacts.weightSpecs,
+                    format: artifacts.format ?? "tfjs-layers-model",
+                    generated_by: artifacts.generatedBy,
+                    converted_by: artifacts.convertedBy,
+                    training: {
+                        epochs_target: epochs.value,
+                        epochs_done: epoch.value,
+                        learning_rate: learningRate.value,
+                        last_loss: loss.value,
+                        loss_history_summary: {
+                            count: lossHistory.value.length,
+                            first: lossHistory.value[0] ?? null,
+                            last: lossHistory.value[lossHistory.value.length - 1] ?? null
+                        }
+                    }
+                },
+                raw: {
+                    weights: arrayToB64(weightBytes)
+                }
+            })
+        );
+        // eslint-disable-next-line no-console
+        console.info(
+            "[training] sent SAVE_CLIENT_MODEL (%d bytes of weights, %d specs)",
+            weightBytes.byteLength,
+            artifacts.weightSpecs.length
+        );
+        return { bytes: weightBytes.byteLength };
+    };
+
     const reset = () => {
         abortController?.abort();
         abortController = null;
@@ -321,6 +394,7 @@ export const useTrainingStore = defineStore("training", () => {
         learningRate,
         start,
         runInference,
+        saveModelToServer,
         reset
     };
 });

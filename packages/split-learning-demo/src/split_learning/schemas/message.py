@@ -14,6 +14,11 @@ class MessageType(str, Enum):
     LOGITS = "logits"
     REQUEST_BATCH = "request_batch"
     BATCH = "batch"
+    # Frontend sends its trained TF.js client weights to the server for
+    # inspection. Payload: `data` carries the model topology JSON +
+    # weight specs + training metadata; `raw.weights` carries the
+    # concatenated Float32 weight bytes.
+    SAVE_CLIENT_MODEL = "save_client_model"
 
 
 class WSMessage(BaseModel):
