@@ -1,5 +1,12 @@
 import { arrayToB64, b64ToArray } from "@/lib/utils/serde";
-import { createClientModel, tensorFromFloat32, tf, type ClientModel } from "@/lib/utils/training";
+import {
+    createClientModel,
+    setTfjsBackend,
+    tensorFromFloat32,
+    tf,
+    type ClientModel,
+    type TfjsBackend
+} from "@/lib/utils/training";
 import { useWebsocketStore } from "@/stores/websocket";
 import { defineStore } from "pinia";
 import { ref, watch } from "vue";
@@ -93,6 +100,9 @@ export const useTrainingStore = defineStore("training", () => {
     // Must be set to match `scripts/server.py --learning-rate`; not
     // forwarded over the protocol (server's optimizer is fixed at startup).
     const learningRate = ref(0.01);
+    // TF.js backend used for the client-side model. webgl is the default
+    // (GPU); cpu is the universal fallback.
+    const tfjsBackend = ref<TfjsBackend>("webgl");
 
     const ensureModel = (): ClientModel => {
         if (!client.value) {
@@ -109,6 +119,9 @@ export const useTrainingStore = defineStore("training", () => {
     });
 
     let abortController: AbortController | null = null;
+    // Tracks why the most recent abort was issued so the catch in start()
+    // can pick the right user-facing message.
+    let abortReason: "user-cancelled" | "ws-dropped" | null = null;
 
     watch(
         () => websocket.status,
@@ -116,10 +129,28 @@ export const useTrainingStore = defineStore("training", () => {
             if (wsStatus === "closed" && status.value === "training") {
                 // eslint-disable-next-line no-console
                 console.warn("[training] WS dropped mid-training; halting loop");
+                abortReason = "ws-dropped";
                 abortController?.abort();
             }
         }
     );
+
+    const cancel = () => {
+        if (status.value !== "training" && status.value !== "loading") return;
+        abortReason = "user-cancelled";
+        abortController?.abort();
+    };
+
+    const setBackend = async (backend: TfjsBackend) => {
+        if (tfjsBackend.value === backend) return;
+        // TF.js tensors don't migrate across backends — dispose any model
+        // that exists so the next start() rebuilds on the new backend.
+        if (client.value) reset();
+        tfjsBackend.value = backend;
+        await setTfjsBackend(backend);
+        // eslint-disable-next-line no-console
+        console.info("[training] TF.js backend set to %s", backend);
+    };
 
     const requestBatch = async (
         signal: AbortSignal
@@ -180,6 +211,7 @@ export const useTrainingStore = defineStore("training", () => {
         let phase = "init";
         abortController?.abort();
         abortController = new AbortController();
+        abortReason = null;
         const { signal } = abortController;
         try {
             const model = ensureModel();
@@ -264,10 +296,19 @@ export const useTrainingStore = defineStore("training", () => {
 
             status.value = "done";
         } catch (e) {
-            status.value = "error";
             if (e instanceof Error && e.message === "aborted") {
-                error.value = `Training stopped — WebSocket dropped at epoch ${epoch.value + 1}/${epochs.value}, batch ${batch.value}/${batchesPerEpoch.value || "?"}. Reconnect, then click Try again.`;
+                const where = `epoch ${epoch.value + 1}/${epochs.value}, batch ${batch.value}/${batchesPerEpoch.value || "?"}`;
+                if (abortReason === "user-cancelled") {
+                    status.value = "idle";
+                    error.value = null;
+                    // eslint-disable-next-line no-console
+                    console.info("[training] cancelled by user at %s", where);
+                } else {
+                    status.value = "error";
+                    error.value = `Training stopped — WebSocket dropped at ${where}. Reconnect, then click Try again.`;
+                }
             } else {
+                status.value = "error";
                 error.value = `phase=${phase} epoch=${epoch.value} batch=${batch.value}: ${describeError(e)}`;
             }
         }
@@ -356,7 +397,10 @@ export const useTrainingStore = defineStore("training", () => {
         loss,
         lossHistory,
         learningRate,
+        tfjsBackend,
         start,
+        cancel,
+        setBackend,
         runInference,
         saveModelToServer,
         reset

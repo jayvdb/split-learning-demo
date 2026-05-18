@@ -23,7 +23,8 @@ const props = defineProps({
     label: { type: String },
     placeholder: { type: String, default: "Select option..." },
     options: { type: Array as PropType<SelectOption[]>, required: true },
-    selectedOption: { type: String, default: null }
+    selectedOption: { type: String, default: null },
+    disabled: { type: Boolean, default: false }
 });
 defineEmits(["change"]);
 const currentOption = computed(() => {
@@ -42,7 +43,14 @@ const optionGroups = computed(() => {
 });
 </script>
 <template>
-    <div class="flex flex-col items-start justify-center">
+    <!-- pointer-events-none on the wrapper is the only reliable way to
+         disable interaction; @ark-ui/vue@0.6.0's <Select> doesn't honour
+         a `disabled` prop end-to-end (the trigger gets disabled but the
+         surrounding click handlers still open the popover). -->
+    <div
+        class="flex flex-col items-start justify-center"
+        :class="{ 'pointer-events-none opacity-60': disabled }"
+    >
         <Select
             v-slot="{ selectedOption: arkSelected, isOpen }"
             :selected-option="
@@ -53,6 +61,7 @@ const optionGroups = computed(() => {
                       }
                     : null
             "
+            :disabled="disabled"
             @change="d => d && $emit('change', d.value)"
         >
             <div class="relative ml-1 flex text-xs font-medium text-base-content text-opacity-80">
@@ -68,7 +77,8 @@ const optionGroups = computed(() => {
             </div>
             <SelectTrigger asChild>
                 <button
-                    class="flex w-72 items-center justify-between rounded-lg border border-base-300 bg-base-100 px-3 py-2 outline-none ring-base-300 ring-offset-0 transition"
+                    :disabled="disabled"
+                    class="flex w-72 items-center justify-between rounded-lg border border-base-300 bg-base-100 px-3 py-2 outline-none ring-base-300 ring-offset-0 transition disabled:cursor-not-allowed disabled:opacity-60"
                     :class="{
                         'ring-2 ring-base-300 ring-offset-2 ring-offset-base-100': isOpen
                     }"

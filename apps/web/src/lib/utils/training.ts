@@ -148,4 +148,16 @@ export const tensorFromFloat32 = (
     shape: number[]
 ): tf.Tensor4D => tf.tensor4d(data, shape as [number, number, number, number]);
 
+// TF.js backends shipped with the base @tensorflow/tfjs bundle. `webgl` is
+// the GPU path (much faster for conv), `cpu` is pure JS (slow but works
+// everywhere). `wasm`/`webgpu` aren't included by default — they'd need
+// separate `@tensorflow/tfjs-backend-*` deps.
+export const TFJS_BACKENDS = ["webgl", "cpu"] as const;
+export type TfjsBackend = (typeof TFJS_BACKENDS)[number];
+
+export const setTfjsBackend = async (backend: TfjsBackend) => {
+    await tf.setBackend(backend);
+    await tf.ready();
+};
+
 export { tf };

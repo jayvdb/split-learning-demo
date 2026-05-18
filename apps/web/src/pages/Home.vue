@@ -14,6 +14,8 @@ import {
 } from "@/lib/utils/image";
 import { argmax, softmax } from "@/lib/utils/math";
 import { deserializeTensor, executionProviderConfig, serializeTensor } from "@/lib/utils/onnx";
+import type { ONNXBackend } from "@/lib/utils/onnx";
+import { TFJS_BACKENDS, type TfjsBackend } from "@/lib/utils/training";
 import { useOnnxStore } from "@/stores/onnx";
 import { useTrainingStore } from "@/stores/training";
 import { useWebsocketStore } from "@/stores/websocket";
@@ -35,12 +37,64 @@ const websocket = useWebsocketStore();
 const training = useTrainingStore();
 
 const isSplitnnTrain = computed(() => model.value?.type === "splitnn-train");
-// We keep the progress panel visible for every state except "done" — that
-// includes "idle" so the Start button is reachable, and "error" so the
-// user can retry without having to switch models away and back.
-const inTrainingPhase = computed(
-    () => isSplitnnTrain.value && training.status !== "done"
+// Panel stays visible the whole time the user is on splitnn-train —
+// during training, after training (Re-train / Send-model controls), and
+// before training (Start button).
+const showTrainingPanel = computed(() => isSplitnnTrain.value);
+// Drawing canvas shows for the inference paths (`splitnn` and `local`) and
+// for `splitnn-train` once training has produced a usable model.
+const showDrawingCanvas = computed(
+    () => !isSplitnnTrain.value || training.status === "done"
 );
+const isTraining = computed(
+    () => training.status === "training" || training.status === "loading"
+);
+
+// Backend dropdown is context-aware: TF.js backends when on splitnn-train,
+// ORT execution providers otherwise. Disabled during training so the user
+// can't swap the runtime out from under an in-flight loop.
+const backendOptions = computed(() => {
+    if (isSplitnnTrain.value) {
+        return TFJS_BACKENDS.map(b => ({ value: b, label: `TF.js: ${b}` }));
+    }
+    return Object.entries(executionProviderConfig).map(([k, v]) => ({
+        value: k,
+        label: v.name
+    }));
+});
+const currentBackend = computed(() =>
+    isSplitnnTrain.value ? training.tfjsBackend : onnx.sessionBackend
+);
+const onBackendChange = (b: string) => {
+    if (isSplitnnTrain.value) {
+        training.setBackend(b as TfjsBackend);
+    } else {
+        onnx.setBackend(b as ONNXBackend);
+    }
+};
+const trainedBadge = computed(() => {
+    switch (training.status) {
+        case "idle":
+            return { label: "TF.js: not trained", tone: "neutral" as const };
+        case "loading":
+            return { label: "TF.js: loading…", tone: "active" as const };
+        case "training":
+            return {
+                label: `TF.js: training (${training.epoch}/${training.epochs} epochs done)`,
+                tone: "active" as const
+            };
+        case "error":
+            return { label: "TF.js: training stopped", tone: "error" as const };
+        case "done":
+            return {
+                label: `TF.js: trained ✓ (${training.epoch} epochs${
+                    training.loss !== null ? `, loss ${training.loss.toFixed(3)}` : ""
+                })`,
+                tone: "ok" as const
+            };
+    }
+    return { label: "TF.js: unknown", tone: "neutral" as const };
+});
 
 // prediction
 const displayPrediction = (output: Tensor) => {
@@ -149,15 +203,10 @@ watchEffect(() => {
     selectModel(model.value?.path);
     if (!model.value) return;
 
-    if (model.value.type === "splitnn-train") {
-        // The browser-trained client lives in the TF.js training store, not
-        // the inference ONNX store. We do NOT auto-start training —
-        // TrainingProgress.vue surfaces a "Start training" button so the
-        // action is discoverable.
-    } else {
-        // Drop any in-memory training state when switching to a non-training
-        // model so the user can flip back and forth without stale UI.
-        if (training.status !== "idle") training.reset();
+    if (model.value.type !== "splitnn-train") {
+        // Load the inference-only ONNX session for the inference paths.
+        // The TF.js training state is left intact in memory so switching
+        // back to splitnn-train lands on the trained model.
         onnx.loadModel(model.value.path);
     }
 });
@@ -170,21 +219,20 @@ watchEffect(() => {
         >
             <div class="mt-6 flex flex-col items-center justify-center gap-4 md:mt-2 md:flex-row">
                 <Select
+                    :key="isSplitnnTrain ? 'tfjs' : 'ort'"
                     label="Backend"
-                    :options="
-                        Object.entries(executionProviderConfig).map(([k, v]) => ({
-                            value: k,
-                            label: v.name
-                        }))
-                    "
-                    :selected-option="onnx.sessionBackend"
-                    @change="d => onnx.setBackend(d)"
+                    :options="backendOptions"
+                    :selected-option="currentBackend"
+                    :disabled="isTraining"
+                    @change="onBackendChange"
                     class="mb-4"
                 />
                 <Select
+                    :key="dataset"
                     label="Model"
                     :options="models[dataset].map(m => ({ value: m.path, label: m.name }))"
                     :selected-option="model ? model.path : models[dataset][0].path"
+                    :disabled="isTraining"
                     @change="selectModel"
                     class="mb-4"
                 />
@@ -195,6 +243,7 @@ watchEffect(() => {
                         { value: 'quickdraw', label: 'QuickDraw' }
                     ]"
                     :selected-option="dataset"
+                    :disabled="isTraining || isSplitnnTrain"
                     @change="d => (dataset = d)"
                     class="mb-4"
                 />
@@ -207,8 +256,28 @@ watchEffect(() => {
                 />
                 <Button class="mb-4" @click="() => connect(parameterServer)">Reconnect</Button>
             </div>
-            <TrainingProgress v-if="inTrainingPhase" />
-            <div v-else class="flex flex-col items-center justify-center md:flex-row">
+            <!-- Permanent TF.js trained-state indicator, only when the
+                 training panel itself isn't already on screen (otherwise
+                 it just duplicates the panel's epoch counter). -->
+            <div v-if="!showTrainingPanel" class="mb-3 flex items-center justify-center">
+                <span
+                    class="rounded-full border px-3 py-1 text-xs font-semibold"
+                    :class="{
+                        'border-base-300 text-base-content text-opacity-70':
+                            trainedBadge.tone === 'neutral',
+                        'border-primary text-primary': trainedBadge.tone === 'active',
+                        'border-success text-success': trainedBadge.tone === 'ok',
+                        'border-error text-error': trainedBadge.tone === 'error'
+                    }"
+                >
+                    {{ trainedBadge.label }}
+                </span>
+            </div>
+            <TrainingProgress v-if="showTrainingPanel" />
+            <div
+                v-if="showDrawingCanvas"
+                class="flex flex-col items-center justify-center md:flex-row"
+            >
                 <div class="flex flex-col items-start justify-end">
                     <div class="flex items-center justify-center">
                         <DrawingCanvas

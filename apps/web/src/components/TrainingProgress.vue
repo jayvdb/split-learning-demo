@@ -22,8 +22,15 @@ const formattedLoss = computed(() =>
 );
 
 const canStart = computed(
-    () => training.status === "idle" || training.status === "error"
+    () =>
+        training.status === "idle" ||
+        training.status === "error" ||
+        training.status === "done"
 );
+const canCancel = computed(
+    () => training.status === "training" || training.status === "loading"
+);
+const isDone = computed(() => training.status === "done");
 const widgetsEditable = computed(
     () => training.status !== "training" && training.status !== "loading"
 );
@@ -45,9 +52,13 @@ const startLabel = computed(() => {
 });
 
 const onStart = () => {
-    if (training.status === "error") training.reset();
+    // "Restart training" / "Try again" re-trains from scratch — wipe the
+    // existing TF.js model so we don't fine-tune on top of stale weights.
+    if (training.status === "error" || training.status === "done") training.reset();
     training.start();
 };
+
+const onCancel = () => training.cancel();
 
 const sendModelStatus = ref<"idle" | "sending" | "sent" | "error">("idle");
 const sendModelInfo = ref<string>("");
@@ -106,6 +117,14 @@ const onLearningRate = (v: string) => {
                 @click="onStart"
             >
                 {{ startLabel }}
+            </button>
+            <button
+                v-if="canCancel"
+                type="button"
+                class="rounded-lg border border-error px-4 py-2 text-error transition hover:scale-95"
+                @click="onCancel"
+            >
+                Cancel
             </button>
         </div>
         <p class="text-xs text-base-content text-opacity-60">
