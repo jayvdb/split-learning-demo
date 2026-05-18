@@ -19,6 +19,11 @@ class MessageType(str, Enum):
     # weight specs + training metadata; `raw.weights` carries the
     # concatenated Float32 weight bytes.
     SAVE_CLIENT_MODEL = "save_client_model"
+    # Tell the server to re-initialise its half (random weights + fresh
+    # optimizer) so joint training starts symmetric with a freshly-built
+    # client. Without this, a previously-trained server clobbers its
+    # learned features as soon as the new random client feeds it noise.
+    RESET_SERVER = "reset_server"
 
 
 class WSMessage(BaseModel):

@@ -39,13 +39,9 @@ const training = useTrainingStore();
 const isSplitnnTrain = computed(() => model.value?.type === "splitnn-train");
 // Panel stays visible the whole time the user is on splitnn-train —
 // during training, after training (Re-train / Send-model controls), and
-// before training (Start button).
+// before training (Start button). It renders *below* the drawing canvas
+// so the inference UI never moves.
 const showTrainingPanel = computed(() => isSplitnnTrain.value);
-// Drawing canvas shows for the inference paths (`splitnn` and `local`) and
-// for `splitnn-train` once training has produced a usable model.
-const showDrawingCanvas = computed(
-    () => !isSplitnnTrain.value || training.status === "done"
-);
 const isTraining = computed(
     () => training.status === "training" || training.status === "loading"
 );
@@ -106,6 +102,12 @@ const displayPrediction = (output: Tensor) => {
     prediction.value = predicted;
 };
 const sendActivationsForInference = (output: Tensor) => {
+    // eslint-disable-next-line no-console
+    console.info(
+        "[inference] sending ACTIVATIONS via ORT — modelType=%s shape=%o",
+        model.value?.type,
+        output.dims
+    );
     const message = {
         type: "activations",
         data: { tensor_shape: output.dims },
@@ -119,6 +121,12 @@ const sendActivationsForInference = (output: Tensor) => {
 };
 
 const sendRawActivationsForInference = (data: Float32Array, shape: number[]) => {
+    // eslint-disable-next-line no-console
+    console.info(
+        "[inference] sending ACTIVATIONS via TF.js — modelType=%s shape=%o",
+        model.value?.type,
+        shape
+    );
     const message = {
         type: "activations",
         data: { tensor_shape: shape },
@@ -204,8 +212,20 @@ watchEffect(() => {
     if (!model.value) return;
 
     if (model.value.type !== "splitnn-train") {
+        // If training was active but the selected model isn't splitnn-train
+        // (can only happen via a Vite HMR — Pinia preserves store state
+        // across reloads, but Home.vue's `model` ref resets), the training
+        // loop is orphaned. Force a clean reset so the dropdowns unlock
+        // and the page is consistent again.
+        if (training.status === "training" || training.status === "loading") {
+            // eslint-disable-next-line no-console
+            console.warn(
+                "[home] orphaned training detected after non-splitnn-train selection; resetting"
+            );
+            training.reset();
+        }
         // Load the inference-only ONNX session for the inference paths.
-        // The TF.js training state is left intact in memory so switching
+        // The TF.js training state is otherwise left intact so switching
         // back to splitnn-train lands on the trained model.
         onnx.loadModel(model.value.path);
     }
@@ -218,15 +238,9 @@ watchEffect(() => {
             class="flex h-full w-full flex-1 flex-col items-center justify-center overflow-hidden px-4"
         >
             <div class="mt-6 flex flex-col items-center justify-center gap-4 md:mt-2 md:flex-row">
-                <Select
-                    :key="isSplitnnTrain ? 'tfjs' : 'ort'"
-                    label="Backend"
-                    :options="backendOptions"
-                    :selected-option="currentBackend"
-                    :disabled="isTraining"
-                    @change="onBackendChange"
-                    class="mb-4"
-                />
+                <!-- Model first — the available Backend options depend on
+                     which Model is selected (ORT execution providers for
+                     ORT models, TF.js backends for splitnn-train). -->
                 <Select
                     :key="dataset"
                     label="Model"
@@ -234,6 +248,15 @@ watchEffect(() => {
                     :selected-option="model ? model.path : models[dataset][0].path"
                     :disabled="isTraining"
                     @change="selectModel"
+                    class="mb-4"
+                />
+                <Select
+                    :key="isSplitnnTrain ? 'tfjs' : 'ort'"
+                    label="Backend"
+                    :options="backendOptions"
+                    :selected-option="currentBackend"
+                    :disabled="isTraining"
+                    @change="onBackendChange"
                     class="mb-4"
                 />
                 <Select
@@ -273,10 +296,17 @@ watchEffect(() => {
                     {{ trainedBadge.label }}
                 </span>
             </div>
-            <TrainingProgress v-if="showTrainingPanel" />
+            <!-- Inference UI is always rendered in the same spot. When
+                 training is running we dim it and block strokes via the
+                 DrawingCanvas `disabled` prop; the user always sees the
+                 canvas, predictions stay in place, and switching modes
+                 doesn't cause the page to reflow. -->
             <div
-                v-if="showDrawingCanvas"
-                class="flex flex-col items-center justify-center md:flex-row"
+                class="flex flex-col items-center justify-center transition-opacity md:flex-row"
+                :class="{
+                    'pointer-events-none opacity-50': isTraining
+                }"
+                :aria-disabled="isTraining"
             >
                 <div class="flex flex-col items-start justify-end">
                     <div class="flex items-center justify-center">
@@ -293,17 +323,28 @@ watchEffect(() => {
                             stroke="currentColor"
                             background-color="#ffffff00"
                             save-as="data"
+                            :disabled="isTraining"
                             @update:image="saveImage"
                         />
                         <span
                             v-if="!canvasRef?.dirty"
                             class="pointer-events-none absolute select-none font-semibold text-base-content text-opacity-80"
                         >
-                            Start drawing here...
+                            {{
+                                isTraining
+                                    ? "Training in progress…"
+                                    : "Start drawing here..."
+                            }}
                         </span>
                     </div>
                     <div class="flex gap-2">
-                        <Button class="mt-2" @click="() => canvasRef?.reset()">Clear</Button>
+                        <Button
+                            class="mt-2"
+                            :disabled="isTraining"
+                            @click="() => canvasRef?.reset()"
+                        >
+                            Clear
+                        </Button>
                     </div>
                 </div>
                 <div class="flex flex-col items-end justify-center">
@@ -318,6 +359,7 @@ watchEffect(() => {
                     />
                 </div>
             </div>
+            <TrainingProgress v-if="showTrainingPanel" class="mt-4" />
         </section>
     </main>
 </template>

@@ -7,11 +7,15 @@ export interface ModelConfig {
 
 export const models: Record<string, ModelConfig[]> = {
     mnist: [
-        { name: "LeNet-5 SplitNN", path: "/models/client_mnist.onnx", type: "splitnn" },
         {
-            name: "LeNet-5 SplitNN (Train using TF.js)",
+            name: "LeNet-5 SplitNN (Train)",
             path: "/models/training/",
             type: "splitnn-train"
+        },
+        {
+            name: "LeNet-5 SplitNN (Static)",
+            path: "/models/client_mnist.onnx",
+            type: "splitnn"
         },
         { name: "LeNet-5", path: "/models/mnist.onnx", type: "local" },
         { name: "ORT Demo", path: "/models/mnist_default.onnx", type: "local" }

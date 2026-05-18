@@ -114,6 +114,18 @@ export const useTrainingStore = defineStore("training", () => {
         return client.value;
     };
 
+    // TF.js's "highest priority registered backend" defaults to webgpu once
+    // we side-effect-import it, regardless of what the user picked in the
+    // dropdown. Without calling tf.setBackend explicitly the first tensor
+    // op triggers a lazy webgpu init that throws if webgpu isn't ready.
+    // Call this before any tensor work to keep TF.js in sync with the
+    // store's `tfjsBackend.value`.
+    const ensureBackend = async () => {
+        if (tf.getBackend() !== tfjsBackend.value) {
+            await setTfjsBackend(tfjsBackend.value);
+        }
+    };
+
     watch(learningRate, lr => {
         if (client.value) client.value.setLearningRate(lr);
     });
@@ -141,15 +153,31 @@ export const useTrainingStore = defineStore("training", () => {
         abortController?.abort();
     };
 
+    // Monotonic id so a slow-failing setBackend can't overwrite the state
+    // produced by a newer attempt that already finished.
+    let backendChangeId = 0;
     const setBackend = async (backend: TfjsBackend) => {
+        // Always clear any prior backend error on a fresh user action,
+        // including the no-op same-backend case (otherwise an error from
+        // a previous failed click is sticky until something else succeeds).
+        error.value = null;
         if (tfjsBackend.value === backend) return;
         // TF.js tensors don't migrate across backends — dispose any model
         // that exists so the next start() rebuilds on the new backend.
         if (client.value) reset();
-        tfjsBackend.value = backend;
-        await setTfjsBackend(backend);
-        // eslint-disable-next-line no-console
-        console.info("[training] TF.js backend set to %s", backend);
+        const myId = ++backendChangeId;
+        try {
+            await setTfjsBackend(backend);
+            if (myId !== backendChangeId) return;
+            tfjsBackend.value = backend;
+            // eslint-disable-next-line no-console
+            console.info("[training] TF.js backend set to %s", backend);
+        } catch (e) {
+            if (myId !== backendChangeId) return;
+            error.value = e instanceof Error ? e.message : String(e);
+            // eslint-disable-next-line no-console
+            console.error("[training] setBackend failed:", e);
+        }
     };
 
     const requestBatch = async (
@@ -214,12 +242,23 @@ export const useTrainingStore = defineStore("training", () => {
         abortReason = null;
         const { signal } = abortController;
         try {
+            phase = "set_backend";
+            await ensureBackend();
+            phase = "init";
             const model = ensureModel();
             status.value = "training";
             error.value = null;
             epoch.value = 0;
             batch.value = 0;
             lossHistory.value = [];
+
+            // Tell the server to reset its half too — otherwise a
+            // previously-trained server gets clobbered by the freshly-
+            // initialised client's random activations during the first
+            // few batches. Fire-and-forget; the server doesn't reply.
+            websocket.sendMessage(
+                encodeEnvelope({ type: "reset_server", data: {}, raw: {} })
+            );
 
             while (epoch.value < epochs.value) {
                 if (signal.aborted) throw new Error("aborted");
@@ -318,6 +357,7 @@ export const useTrainingStore = defineStore("training", () => {
         imageNchw: Float32Array,
         shape: number[]
     ): Promise<{ activations: Float32Array; shape: number[] }> => {
+        await ensureBackend();
         const model = ensureModel();
         const input = tensorFromFloat32(imageNchw, shape);
         const out = model.forward(input);

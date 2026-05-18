@@ -246,6 +246,28 @@ def main(
     criterion = nn.CrossEntropyLoss()
     model, optimizer = fabric.setup(model, optimizer)
 
+    def reinitialise_server_half():
+        """Reset the server's model + optimizer to random init.
+
+        Frontend sends RESET_SERVER before a fresh training run so the
+        two halves start jointly random. Without this, the previously
+        co-adapted server clobbers its features when fed activations from
+        a freshly-initialised TF.js client.
+        """
+        nonlocal model, unwrapped_model, optimizer
+        new_inner = CNN2D(
+            in_channels=1, dim_out=10, img_size=28, dropout=0.15
+        )
+        new_outer = CNN2DServer(
+            in_channels=1, dim_out=10, img_size=28, model=new_inner
+        )
+        unwrapped_model = new_outer
+        new_optimizer = torch.optim.SGD(
+            new_outer.parameters(), lr=learning_rate, momentum=0.9
+        )
+        model, optimizer = fabric.setup(new_outer, new_optimizer)
+        _logger.info("Server half re-initialised (random weights, fresh optimizer)")
+
     batch_stream: MnistBatchStream | None = None
 
     def get_batch_stream() -> MnistBatchStream:
@@ -375,6 +397,11 @@ def main(
                     )
                     encoded_response = encode_message_b64(response_message)
                     await websocket.send_bytes(encoded_response)
+                elif message.type == MessageType.RESET_SERVER:
+                    reinitialise_server_half()
+                    # Drop per-session stats too so the [running]/[epoch]
+                    # log lines reflect only the post-reset run.
+                    stats = TrainingStats(log_every=50)
                 elif message.type == MessageType.SAVE_CLIENT_MODEL:
                     import json
                     import time as _time
@@ -400,12 +427,25 @@ def main(
                         len(message.raw["weights"]),
                     )
                 elif message.type == MessageType.ACTIVATIONS:
+                    shape = tuple(message.data.get("tensor_shape", []))
+                    # CNN2DServer expects (B, 16, 7, 7) — the post-cut
+                    # activation shape. Anything else means the wrong tensor
+                    # got dispatched (we've seen LOGITS-shaped [B, 10]
+                    # arrive here on race conditions). Reject with a clear
+                    # log line instead of crashing the loop.
+                    if len(shape) != 4 or shape[1:] != (16, 7, 7):
+                        _logger.error(
+                            "Ignoring ACTIVATIONS with unexpected shape %s "
+                            "(server expects (B, 16, 7, 7))",
+                            list(shape),
+                        )
+                        continue
+
                     activations = deserialize_tensor(
                         message.raw["tensor"], dtype=torch.float32
                     )
-
                     activations = activations.to(fabric.device)
-                    activations = activations.reshape(*message.data["tensor_shape"])
+                    activations = activations.reshape(*shape)
 
                     model.eval()
                     outputs = model(activations)

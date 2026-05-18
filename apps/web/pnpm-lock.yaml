@@ -10,6 +10,9 @@ dependencies:
   '@tensorflow/tfjs':
     specifier: ^4.22.0
     version: 4.22.0(seedrandom@3.0.5)
+  '@tensorflow/tfjs-backend-webgpu':
+    specifier: ^4.22.0
+    version: 4.22.0(@tensorflow/tfjs-core@4.22.0)
   '@vueuse/core':
     specifier: ^10.3.0
     version: 10.3.0(vue@3.3.4)
@@ -659,6 +662,15 @@ packages:
       '@types/offscreencanvas': 2019.3.0
       '@types/seedrandom': 2.4.34
       seedrandom: 3.0.5
+    dev: false
+
+  /@tensorflow/tfjs-backend-webgpu@4.22.0(@tensorflow/tfjs-core@4.22.0):
+    resolution: {integrity: sha512-lvIc7Af4Tl2BCdYp43iQmSCRq3asaKT0q2xaErphXiUZ+jqeB0bQa0ZvQys1Xatvto0U4/c90DVsHPfvkn5ftg==}
+    peerDependencies:
+      '@tensorflow/tfjs-core': 4.22.0
+    dependencies:
+      '@tensorflow/tfjs-backend-cpu': 4.22.0(@tensorflow/tfjs-core@4.22.0)
+      '@tensorflow/tfjs-core': 4.22.0
     dev: false
 
   /@tensorflow/tfjs-converter@4.22.0(@tensorflow/tfjs-core@4.22.0):

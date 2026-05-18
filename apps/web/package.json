@@ -19,6 +19,7 @@
         "@ark-ui/vue": "^0.6.0",
         "@observablehq/plot": "^0.6.10",
         "@tensorflow/tfjs": "^4.22.0",
+        "@tensorflow/tfjs-backend-webgpu": "^4.22.0",
         "@vueuse/core": "^10.3.0",
         "motion": "^10.16.2",
         "oh-vue-icons": "1.0.0-rc3",
