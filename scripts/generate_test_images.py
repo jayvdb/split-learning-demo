@@ -1,9 +1,13 @@
 """Render 10 single-digit test images for the e2e classifier check.
 
-Downloads Indie Flower (Google Fonts, OFL) and renders digits 0-9 as
-28x28 grayscale PNGs — the same size the trained split model consumes.
-A 280x280 preview is also written for each digit so the rendering is
-easy to inspect by eye.
+Downloads handwriting Google Fonts (OFL) and renders digits 0-9 as 28x28
+grayscale PNGs — the same size the trained split model consumes. A
+280x280 preview is also written for each digit so the rendering is easy
+to inspect by eye.
+
+Indie Flower is the default. Specific digits can override to a different
+font when the IndieFlower glyph is genuinely ambiguous to an MNIST-
+trained classifier (e.g. its open-top, horizontal-stroke 6 reads as a 5).
 """
 
 import urllib.request
@@ -11,10 +15,25 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-FONT_URL = (
-    "https://raw.githubusercontent.com/google/fonts/main/"
-    "ofl/indieflower/IndieFlower-Regular.ttf"
-)
+FONT_URLS = {
+    "IndieFlower-Regular.ttf": (
+        "https://raw.githubusercontent.com/google/fonts/main/"
+        "ofl/indieflower/IndieFlower-Regular.ttf"
+    ),
+    "PatrickHand-Regular.ttf": (
+        "https://raw.githubusercontent.com/google/fonts/main/"
+        "ofl/patrickhand/PatrickHand-Regular.ttf"
+    ),
+}
+
+# digit -> font filename. Anything not listed uses the default.
+DEFAULT_FONT = "IndieFlower-Regular.ttf"
+PER_DIGIT_FONT = {
+    # IndieFlower's 6 has a long horizontal top stroke flowing into a
+    # bowl; MNIST-trained classifiers read that as 5+flag. Patrick Hand's
+    # 6 closes the top into a tighter, more conventional loop.
+    6: "PatrickHand-Regular.ttf",
+}
 
 
 def main() -> None:
@@ -24,18 +43,21 @@ def main() -> None:
     font_dir.mkdir(parents=True, exist_ok=True)
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    font_path = font_dir / "IndieFlower-Regular.ttf"
-    if not font_path.exists():
-        print(f"Downloading {FONT_URL} -> {font_path}")
-        urllib.request.urlretrieve(FONT_URL, font_path)
+    fonts: dict[str, ImageFont.FreeTypeFont] = {}
+    for fname, url in FONT_URLS.items():
+        fpath = font_dir / fname
+        if not fpath.exists():
+            print(f"Downloading {url} -> {fpath}")
+            urllib.request.urlretrieve(url, fpath)
+        fonts[fname] = ImageFont.truetype(str(fpath), 280)
 
     # Render on a generous canvas, then crop to the actual ink bounding box
     # (the font's logical bbox is much taller than its glyph for Indie
     # Flower) before centring at MNIST's ~20px-in-28px target envelope.
     big = 400
-    font = ImageFont.truetype(str(font_path), 280)
 
     for digit in range(10):
+        font = fonts[PER_DIGIT_FONT.get(digit, DEFAULT_FONT)]
         scratch = Image.new("L", (big, big), color=0)
         ImageDraw.Draw(scratch).text((big / 2, big / 2), str(digit), fill=255, font=font, anchor="mm")
         ink_bbox = scratch.getbbox()  # (l, t, r, b) of non-zero pixels

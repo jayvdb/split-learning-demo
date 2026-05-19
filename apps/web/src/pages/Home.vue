@@ -335,28 +335,63 @@ if (headlessParams.get("headless") === "true") {
                 chosen,
                 requested
             );
-            await training.start();
-            // Graceful early-stop: TF.js's WebGPU backend leaks GPU
+
+            // End-of-epoch snapshots. TF.js's WebGPU backend leaks GPU
             // buffers over thousands of ops and eventually trips
-            // createBuffer/OOM mid-run. There's no public API to flush
-            // the pool. If we got at least one full epoch in, the
-            // in-memory model is already well-trained — capture it
-            // rather than throwing the whole run away. CPU/WebGL runs
-            // won't hit this branch.
-            if (training.status === "error" && training.epoch >= 1) {
-                console.warn(
-                    "[headless] training stopped at epoch %d/%d (%s) — saving the partial model anyway",
-                    training.epoch,
-                    headlessEpochs,
-                    training.error ?? "(no message)"
-                );
-            } else if (training.status !== "done") {
+            // createBuffer/OOM mid-run, leaving the GPU device dead and
+            // its weight buffers unreadable. Trying to call
+            // saveModelToServer() after the crash fails too (the export
+            // path reads weights via mapAsync from the dead device). So
+            // we save *after every epoch* while the GPU is still alive:
+            // each save overwrites apps/web/public/models/client_mnist.*,
+            // so on crash the latest healthy snapshot is already on disk.
+            let snapshotsSaved = 0;
+            const stopSnapshotWatch = watch(
+                () => training.epoch,
+                async (newEpoch, oldEpoch) => {
+                    if (newEpoch <= (oldEpoch ?? 0) || newEpoch < 1) return;
+                    try {
+                        await training.saveModelToServer();
+                        snapshotsSaved = newEpoch;
+                        console.info(
+                            "[headless] snapshot saved at end of epoch %d",
+                            newEpoch
+                        );
+                    } catch (e) {
+                        console.warn(
+                            "[headless] snapshot save failed at epoch %d: %s",
+                            newEpoch,
+                            e instanceof Error ? e.message : String(e)
+                        );
+                    }
+                }
+            );
+
+            try {
+                await training.start();
+            } finally {
+                stopSnapshotWatch();
+            }
+
+            if (snapshotsSaved < 1) {
                 throw new Error(
-                    `training ended status=${training.status} error=${training.error ?? "(none)"}`
+                    `training failed before completing even 1 epoch (status=${training.status} error=${training.error ?? "(none)"})`
                 );
             }
-            await training.saveModelToServer();
-            console.info("[headless] saved model; marking done");
+            if (training.status === "error") {
+                console.warn(
+                    "[headless] training stopped at epoch %d/%d (%s) — using epoch-%d snapshot already on disk",
+                    training.epoch,
+                    headlessEpochs,
+                    training.error ?? "(no message)",
+                    snapshotsSaved
+                );
+            } else {
+                console.info(
+                    "[headless] training done; last snapshot is epoch %d",
+                    snapshotsSaved
+                );
+            }
             w.__headlessDone = true;
         } catch (e) {
             const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
