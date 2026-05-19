@@ -25,6 +25,26 @@ If your operating system is not Linux or Windows (64bit), or doesnt have an Nvid
 remove the line containing `pytorch::pytorch-cuda` from `environment.yml` before creating
 the environment.
 
+### Ubuntu system packages (CPU-only)
+
+PyTorch and torchvision wheels are self-contained, but they dynamically link
+against a few shared libraries that minimal Ubuntu installs (and slim Docker
+images) do not ship. To run on CPU without a GPU, install:
+
+```sh
+sudo apt install libgomp1 libgl1 libglib2.0-0
+```
+
+- `libgomp1` — GNU OpenMP runtime that PyTorch links against for CPU threading.
+- `libgl1` — OpenGL loader. torchvision's image ops `dlopen` it at import time;
+  without it you get `ImportError: libGL.so.1: cannot open shared object file`.
+  On Ubuntu ≤ 22.04 the equivalent (transitional) package was
+  `libgl1-mesa-glx`, which was dropped in 23.10+.
+- `libglib2.0-0` — pulled in alongside `libgl1` by several image-processing
+  paths; cheap to install and avoids a second round-trip if you hit it.
+
+No NVIDIA / CUDA / Mesa-driver packages are needed for CPU-only use.
+
 ### Web
 
 To install the webapp:
@@ -37,6 +57,29 @@ pnpm install
 ## Usage
 
 Demos scripts can be found in the `scripts` directory.
+
+### Fetch the dataset
+
+The server, MPI client, and standalone client all read MNIST from disk —
+nothing is downloaded on the fly. The
+[Hugging Face Hub CLI](https://huggingface.co/docs/huggingface_hub/main/en/guides/cli)
+is provisioned by `mise install` (see `mise.toml`); prefetch the dataset
+once with:
+
+```sh
+python scripts/fetch_data.py            # downloads ylecun/mnist (parquet)
+```
+
+The parquet files land under `data/external/mnist/` and are gitignored.
+Running any of the training scripts without this step will fail fast with
+a "MNIST parquet not found" error rather than silently hitting the
+network.
+
+Alternatively run:
+
+```sh
+hf download ylecun/mnist --repo-type dataset --local-dir data/external/mnist
+```
 
 ### Server/Client
 

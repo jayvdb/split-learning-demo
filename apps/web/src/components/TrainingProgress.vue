@@ -129,8 +129,7 @@ const onLearningRate = (v: string) => {
         </div>
         <p class="text-xs text-base-content text-opacity-60">
             Set <em>Learning rate</em> to match the server's
-            <code>--learning-rate</code> CLI flag (default
-            <code>1e-4</code>).
+            <code>--learning-rate</code> CLI flag.
         </p>
 
         <div v-if="training.error" class="text-sm text-error">

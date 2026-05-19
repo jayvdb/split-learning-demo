@@ -162,7 +162,14 @@ _logger = logging.getLogger(__name__)
     help="path to config file",
 )
 # training
-@click.option("--learning-rate", "learning_rate", type=float, default=1e-4)
+@click.option(
+    "--learning-rate",
+    "learning_rate",
+    type=float,
+    default=0.01,
+    show_default=True,
+    help="SGD learning rate. Must match the browser's value (frontend default 0.01).",
+)
 @click.option("--grad-clip", "grad_clip", type=float, default=0.5)
 # runtime
 @click.option(
@@ -204,6 +211,16 @@ def main(
         datefmt="%Y-%m-%d %H:%M",
         format="[%(asctime)s] %(levelname)s: %(message)s",
     )
+
+    # Echo the values the frontend has to match. Mismatched learning rate /
+    # grad clip between server and browser silently degrades convergence.
+    _logger.info("Server config:")
+    _logger.info("  --learning-rate          %s", learning_rate)
+    _logger.info("  --grad-clip              %s", grad_clip)
+    _logger.info("  --grad-accumulate-every  %s", grad_accumulate_every)
+    _logger.info("  --validate-every         %s", validate_every)
+    _logger.info("  --generate-every         %s", generate_every)
+    _logger.info("  --accelerator            %s", accelerator)
 
     # accelerator
     fabric = L.Fabric(accelerator=accelerator, precision="32-true")

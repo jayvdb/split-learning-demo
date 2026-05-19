@@ -4,6 +4,7 @@ from typing import Any, Callable, Dict, List, Union
 from datasets import (
     Dataset,
     DatasetDict,
+    Image,
     IterableDataset,
     IterableDatasetDict,
     load_dataset,
@@ -100,8 +101,63 @@ def dataset_loader(
     return decorator
 
 
-@dataset_loader("mnist", transform_columns_=["image"])
-def mnist(dataset):
+def mnist(
+    split: str = None,
+    transform: Callable[[Any], Any] = None,
+    transform_columns: List[str] = None,
+):
+    """Load the MNIST dataset from the pre-fetched parquet files.
+
+    Run ``python scripts/fetch_data.py --dataset mnist`` once to populate
+    ``data/external/mnist/`` (parquet from the ``ylecun/mnist`` HF repo).
+    """
+    data_dir = utils.data_path() / "external" / "mnist"
+    train_files = sorted(data_dir.rglob("train-*.parquet"))
+    test_files = sorted(data_dir.rglob("test-*.parquet"))
+    if not train_files or not test_files:
+        raise FileNotFoundError(
+            f"MNIST parquet not found under {data_dir}. "
+            "Run: python scripts/fetch_data.py --dataset mnist"
+        )
+
+    train_paths = [str(p) for p in train_files]
+    test_paths = [str(p) for p in test_files]
+
+    # Use Dataset.from_parquet directly instead of load_dataset("parquet", ...).
+    # The latter looks up a `parquet.py` dataset script on the legacy HF s3
+    # bucket every call (a 404, ignored) before falling back to the in-library
+    # builder; from_parquet skips that lookup and stays fully offline.
+    if split == "train":
+        dataset = Dataset.from_parquet(train_paths)
+    elif split == "test":
+        dataset = Dataset.from_parquet(test_paths)
+    elif split is None:
+        dataset = DatasetDict(
+            {
+                "train": Dataset.from_parquet(train_paths),
+                "test": Dataset.from_parquet(test_paths),
+            }
+        )
+    else:
+        raise ValueError(f"Unknown split: {split!r} (expected 'train', 'test', or None)")
+
+    # Parquet preserves the image column as raw bytes; cast it back so the
+    # transform pipeline sees PIL.Image like the previous loader did.
+    dataset = dataset.cast_column("image", Image())
+
+    if transform is not None:
+        cols = transform_columns or ["image"]
+
+        def hf_transforms(examples):
+            for column in cols:
+                examples[column] = [transform(image) for image in examples[column]]
+            return examples
+
+        # Don't pass columns=cols here — set_transform's columns arg restricts
+        # which columns are *loaded* before transform, so the label would be
+        # filtered out of the output. The transform itself only mutates `cols`.
+        dataset.set_transform(hf_transforms)
+
     return dataset
 
 

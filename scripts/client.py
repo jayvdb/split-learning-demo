@@ -39,7 +39,9 @@ _logger = logging.getLogger(__name__)
 # training
 @click.option("--num-epochs", "num_epochs", type=int, default=50)
 @click.option("--batch-size", "batch_size", type=int, default=128)
-@click.option("--learning-rate", "learning_rate", type=float, default=1e-4)
+@click.option(
+    "--learning-rate", "learning_rate", type=float, default=0.01, show_default=True
+)
 @click.option("--grad-clip", "grad_clip", type=float, default=0.5)
 # param server
 @click.option("--host", "host", type=str, default="127.0.0.1")

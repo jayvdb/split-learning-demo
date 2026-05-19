@@ -1,0 +1,5 @@
+[tools]
+micromamba = "latest"
+pixi = "latest"
+pnpm = "latest"
+"pipx:huggingface_hub[cli]" = "latest"
