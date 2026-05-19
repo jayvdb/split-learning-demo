@@ -171,6 +171,18 @@ _logger = logging.getLogger(__name__)
     help="SGD learning rate. Must match the browser's value (frontend default 0.01).",
 )
 @click.option("--grad-clip", "grad_clip", type=float, default=0.5)
+@click.option(
+    "--batch-size",
+    "batch_size",
+    type=int,
+    default=128,
+    show_default=True,
+    help=(
+        "Batch size streamed to clients. 128 is fine for CPU / CUDA / WebGL, but "
+        "WebGPU in headless Chromium can hit VK_ERROR_OUT_OF_DEVICE_MEMORY on the "
+        "second batch with 128; drop to 32 if you see device-lost errors."
+    ),
+)
 # runtime
 @click.option(
     "--accelerator",
@@ -195,6 +207,7 @@ def main(
     # training
     learning_rate: float,
     grad_clip: float,
+    batch_size: int,
     # runtime
     accelerator: str,
     # logging
@@ -217,6 +230,7 @@ def main(
     _logger.info("Server config:")
     _logger.info("  --learning-rate          %s", learning_rate)
     _logger.info("  --grad-clip              %s", grad_clip)
+    _logger.info("  --batch-size             %s", batch_size)
     _logger.info("  --grad-accumulate-every  %s", grad_accumulate_every)
     _logger.info("  --validate-every         %s", validate_every)
     _logger.info("  --generate-every         %s", generate_every)
@@ -246,7 +260,9 @@ def main(
         img_size=28,
         dropout=0.15,
     )
-    server_onnx_path = utils.workspace_root_path() / "data/models/server_mnist.onnx"
+    models_out = utils.workspace_root_path() / "apps/web/public/models"
+    models_out.mkdir(parents=True, exist_ok=True)
+    server_onnx_path = models_out / "server_mnist.onnx"
 
     model = CNN2DServer(in_channels=1, dim_out=10, img_size=28, model=model)
     if server_onnx_path.exists():
@@ -291,7 +307,7 @@ def main(
         nonlocal batch_stream
         if batch_stream is None:
             _logger.info("Initialising MNIST batch stream for browser training...")
-            batch_stream = MnistBatchStream(batch_size=128)
+            batch_stream = MnistBatchStream(batch_size=batch_size)
         return batch_stream
 
     class TrainingStats:
@@ -421,12 +437,8 @@ def main(
                     stats = TrainingStats(log_every=50)
                 elif message.type == MessageType.SAVE_CLIENT_MODEL:
                     import json
-                    import time as _time
 
-                    out_dir = utils.workspace_root_path() / "data/models"
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    stem = out_dir / f"frontend_client_{int(_time.time())}"
-
+                    stem = models_out / "client_mnist"
                     meta = {
                         "topology": message.data.get("topology"),
                         "weight_specs": message.data.get("weight_specs"),

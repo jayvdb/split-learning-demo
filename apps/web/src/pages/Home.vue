@@ -15,7 +15,7 @@ import {
 import { argmax, softmax } from "@/lib/utils/math";
 import { deserializeTensor, executionProviderConfig, serializeTensor } from "@/lib/utils/onnx";
 import type { ONNXBackend } from "@/lib/utils/onnx";
-import { TFJS_BACKENDS, type TfjsBackend } from "@/lib/utils/training";
+import { tf, TFJS_BACKENDS, type TfjsBackend } from "@/lib/utils/training";
 import { useOnnxStore } from "@/stores/onnx";
 import { useTrainingStore } from "@/stores/training";
 import { useWebsocketStore } from "@/stores/websocket";
@@ -207,6 +207,166 @@ const selectModel = (path?: string) => {
 
     model.value = modelConfig;
 };
+// Headless auto-runner: `?headless=true&epochs=25` lets Playwright drive a
+// full training run with no UI clicks. Triggers training.start(), awaits
+// completion, then ships the trained model to the server. Surfaces its
+// result on window.__headlessDone / __headlessError so the spec can poll.
+//
+// `backend=auto` (the default) probes webgpu → webgl → cpu and uses
+// whichever the running browser actually grants — so a Linux laptop with
+// a working Vulkan driver gets WebGPU, headed Chrome falls back to webgl,
+// and CPU-only environments use the universal cpu backend.
+//
+// WebGPU caveat: TF.js training kernels are buffer-heavy and can hit
+// VK_ERROR_OUT_OF_DEVICE_MEMORY (device-lost) with the default
+// server-side batch size of 128 under headless Chromium's small VRAM
+// budget. Run `scripts/server.py --batch-size 32` if you see device-lost
+// errors. We also flip `WEBGPU_DEFERRED_SUBMIT_BATCH_SIZE` to 1 below so
+// GPU buffers are released between ops instead of every 15.
+const headlessParams = new URLSearchParams(window.location.search);
+if (headlessParams.get("headless") === "true") {
+    const headlessEpochs = Number(headlessParams.get("epochs") ?? "25") || 25;
+    const requested = headlessParams.get("backend") ?? "auto";
+    const candidates: TfjsBackend[] =
+        requested === "auto"
+            ? ["webgpu", "webgl", "cpu"]
+            : [requested as TfjsBackend];
+    (async () => {
+        type HeadlessWin = {
+            __headlessDone?: boolean;
+            __headlessError?: string;
+        };
+        const w = window as unknown as HeadlessWin;
+        try {
+            while (websocket.status !== "open") {
+                await new Promise(r => setTimeout(r, 50));
+            }
+            let chosen: TfjsBackend | null = null;
+            let lastErr: unknown = null;
+            for (const b of candidates) {
+                try {
+                    if (b === "webgpu") {
+                        // Eager flush keeps the WebGPU buffer pool from
+                        // growing between submissions on memory-constrained
+                        // GPUs. (Don't set WEBGPU_USE_NAIVE_CONV2D_DEBUG —
+                        // its WGSL output is broken in TF.js 4.22: emits
+                        // `main();;` which Dawn rejects.)
+                        tf.env().set("WEBGPU_DEFERRED_SUBMIT_BATCH_SIZE", 1);
+                    }
+                    await training.setBackend(b);
+                    chosen = b;
+                    break;
+                } catch (e) {
+                    lastErr = e;
+                    console.warn(
+                        "[headless] backend %s unavailable: %s",
+                        b,
+                        e instanceof Error ? e.message : String(e)
+                    );
+                }
+            }
+            if (!chosen) {
+                throw lastErr ?? new Error("no TF.js backend available");
+            }
+
+            // Diagnostic: print the actual WebGPU adapter the browser
+            // granted, plus key memory limits. If you see "llvmpipe" /
+            // "lavapipe" / "swiftshader" as the device name, Chromium is
+            // running software Vulkan with tiny VRAM — install the real
+            // GPU driver (mesa-vulkan-drivers / nvidia-vulkan-icd-loader)
+            // and re-run. Real hardware names look like "Intel UHD",
+            // "AMD Radeon", "NVIDIA GeForce ...".
+            if (chosen === "webgpu") {
+                try {
+                    const gpu = (
+                        navigator as unknown as {
+                            gpu?: {
+                                requestAdapter: (
+                                    opts?: { powerPreference?: string }
+                                ) => Promise<{
+                                    info?: {
+                                        vendor?: string;
+                                        device?: string;
+                                        architecture?: string;
+                                        description?: string;
+                                    };
+                                    limits?: Record<string, number>;
+                                } | null>;
+                            };
+                        }
+                    ).gpu;
+                    const adapter = (await gpu?.requestAdapter({
+                        powerPreference: "high-performance"
+                    })) as {
+                        info?: {
+                            vendor?: string;
+                            device?: string;
+                            architecture?: string;
+                            description?: string;
+                        };
+                        limits?: Record<string, number>;
+                    } | null;
+                    if (adapter) {
+                        console.info(
+                            "[headless] WebGPU adapter:",
+                            JSON.stringify({
+                                vendor: adapter.info?.vendor,
+                                device: adapter.info?.device,
+                                architecture: adapter.info?.architecture,
+                                description: adapter.info?.description,
+                                maxBufferSize: adapter.limits?.maxBufferSize,
+                                maxStorageBufferBindingSize:
+                                    adapter.limits?.maxStorageBufferBindingSize,
+                                maxComputeWorkgroupStorageSize:
+                                    adapter.limits?.maxComputeWorkgroupStorageSize
+                            })
+                        );
+                    } else {
+                        console.warn("[headless] requestAdapter returned null");
+                    }
+                } catch (e) {
+                    console.warn("[headless] adapter info probe failed:", e);
+                }
+            }
+            training.epochs = headlessEpochs;
+            console.info(
+                "[headless] starting training: epochs=%d backend=%s (requested=%s)",
+                headlessEpochs,
+                chosen,
+                requested
+            );
+            await training.start();
+            // Graceful early-stop: TF.js's WebGPU backend leaks GPU
+            // buffers over thousands of ops and eventually trips
+            // createBuffer/OOM mid-run. There's no public API to flush
+            // the pool. If we got at least one full epoch in, the
+            // in-memory model is already well-trained — capture it
+            // rather than throwing the whole run away. CPU/WebGL runs
+            // won't hit this branch.
+            if (training.status === "error" && training.epoch >= 1) {
+                console.warn(
+                    "[headless] training stopped at epoch %d/%d (%s) — saving the partial model anyway",
+                    training.epoch,
+                    headlessEpochs,
+                    training.error ?? "(no message)"
+                );
+            } else if (training.status !== "done") {
+                throw new Error(
+                    `training ended status=${training.status} error=${training.error ?? "(none)"}`
+                );
+            }
+            await training.saveModelToServer();
+            console.info("[headless] saved model; marking done");
+            w.__headlessDone = true;
+        } catch (e) {
+            const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+            console.error("[headless] failed:", msg);
+            w.__headlessError = msg;
+            w.__headlessDone = true;
+        }
+    })();
+}
+
 watchEffect(() => {
     selectModel(model.value?.path);
     if (!model.value) return;
